@@ -17416,5 +17416,9 @@
     "resolve_explanation": "Aktuellen Wert behalten. Anwenden speichert diese Entscheidung und schließt ausstehende Vorschläge.",
     "forget_count": "Ausgewählte Erinnerungen vergessen: {{count}}",
     "retry_preview_page": "Vorschauseite erneut laden"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }

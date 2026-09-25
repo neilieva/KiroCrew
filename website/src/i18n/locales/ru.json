@@ -17904,5 +17904,9 @@
     "resolve_explanation": "Сохрани текущее значение. Применение запишет решение и закроет его ожидающие предложения.",
     "forget_count": "Забыть выбранные воспоминания: {{count}}",
     "retry_preview_page": "Повторить загрузку страницы предпросмотра"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }

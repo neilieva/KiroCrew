@@ -17416,5 +17416,9 @@
     "resolve_explanation": "मौजूदा मान रखो। लागू करने से निर्णय दर्ज होगा और इसके लंबित प्रस्ताव बंद होंगे।",
     "forget_count": "चुनी हुई यादें भूलें: {{count}}",
     "retry_preview_page": "पूर्वावलोकन पृष्ठ फिर आज़माएँ"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }

@@ -17172,5 +17172,9 @@
     "resolve_explanation": "保留当前值。应用后记录此决定，并关闭其待处理提案。",
     "forget_count": "忘记所选记忆：{{count}}",
     "retry_preview_page": "重试预览页面"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }

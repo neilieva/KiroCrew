@@ -17660,5 +17660,9 @@
     "resolve_explanation": "Conserva el valor actual. Aplicar registra esta decisión y cierra sus propuestas pendientes.",
     "forget_count": "Olvidar recuerdos seleccionados: {{count}}",
     "retry_preview_page": "Reintentar página de vista previa"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }

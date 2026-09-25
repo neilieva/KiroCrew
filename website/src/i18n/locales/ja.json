@@ -17172,5 +17172,9 @@
     "resolve_explanation": "現在の値を保持します。適用すると判断を記録し、保留中の提案を終了します。",
     "forget_count": "選択したメモリを忘れる: {{count}}",
     "retry_preview_page": "プレビューページを再試行"
+  },
+  "featurePreviewsTab": {
+    "layout_harness": "Composable layout",
+    "layout_harness_desc": "Dev-only preview of the placement-driven layout mechanism (renderer + scope + editor), built beside the Members page. Off by default; the mechanism is still being built and has no door of its own yet."
   }
 }
