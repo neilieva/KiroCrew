@@ -35,6 +35,10 @@ export interface KiroPrerequisiteStatus {
    * CLI is installed.
    */
   sandbox_unavailable: boolean
+  /** Crew OS sandbox capability; absent on older gateways, so bypass requires true. */
+  sandbox_backend_available?: boolean
+  /** Runtime-enforced harness ids whose credential mask cannot apply at the effective tier. */
+  sandbox_blocked_backends?: string[]
   /** Machine-readable: 'transient' | 'foreign_sandbox' | 'no_backend' | ''. */
   sandbox_failure_kind: string
   /** Technical probe reason, e.g. 'unshare(CLONE_NEWNS) failed with errno 1 (EPERM)'. */
