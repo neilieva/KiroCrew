@@ -8,7 +8,7 @@
 // renamed by a list change is planned by the shift capture
 // (shiftCompensation.ts, via planHeightRetirement) and drained here.
 
-import { useCallback, useMemo, useRef, useSyncExternalStore, type MutableRefObject, type RefObject } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore, type MutableRefObject, type RefObject } from 'react'
 import { isRailSettling } from '../useRailWidth'
 import { inPlaceDeltaAbove, resizedInPlaceBelow } from './inPlaceResize'
 import { HeightIndex } from './HeightIndex'
@@ -252,6 +252,8 @@ export interface RowMeasurement {
   farmIsMeasured: (index: number) => boolean
   farmRecord: (index: number, key: string, px: number) => boolean
   farmRowMounted: (index: number) => boolean
+  /** Seed the current owner from every mounted row's live height (gated). */
+  reseedMounted: () => void
 }
 
 export function useRowMeasurement<T>(ctx: {
@@ -263,16 +265,40 @@ export function useRowMeasurement<T>(ctx: {
   resizeObserverRef: Ref<ResizeObserver | null>
   trailingRef: RefObject<HTMLDivElement>
   heightIndexRef: Ref<HeightIndex | null>
+  canMeasure?: () => boolean
   windowRangeRef: Ref<WindowRange>
   grace: Pick<StreamingGrace, 'graceIndexRef'>
   sync: Pick<GeometrySync, 'scheduleHeightSync'>
 }): RowMeasurement {
   const {
     itemsRef, getKeyRef, streamingIndexRef, eagerFirstMeasureRef, elIndexRef, resizeObserverRef,
-    trailingRef, heightIndexRef, windowRangeRef,
+    trailingRef, heightIndexRef, windowRangeRef, canMeasure,
   } = ctx
   const { graceIndexRef } = ctx.grace
   const { scheduleHeightSync } = ctx.sync
+  // During a debounced width transition the DOM has reflowed but the owner
+  // still holds the old width. All writers must refuse that measurement.
+  const canMeasureRef = useRef(canMeasure)
+  canMeasureRef.current = canMeasure
+  const measurementIndex = useCallback(() =>
+    canMeasureRef.current?.() === false ? null : heightIndexRef.current, [heightIndexRef])
+
+  // ---- Live height, per mounted node ----
+  // The height the DOM last showed for a mounted row, whichever scope owns the
+  // cache. Classifying a fire -- first mount vs resize, and the above-fold
+  // delta the compensation adds to scrollTop -- needs the row's height at its
+  // PREVIOUS fire, and the persisted cache cannot supply it during a width
+  // transition: the gate refuses the write, so the cache keeps the old width's
+  // height for the whole drag plus the settle debounce. Reading that refused
+  // height would price every fire from the OLD width (100 -> 120 -> 140
+  // credited 20 + 40 rather than 20 + 20, a repeated 140 credited 40 rather
+  // than 0), each added straight to scrollTop; skipping classification would
+  // leave the reader displaced by every re-wrap above them, since WebKit has
+  // no native anchor to fall back on. Keyed by node, not index: it follows a
+  // row across an index shift and dies with the element -- the ref callback
+  // drops the entry when the node detaches, and a remounted row is a new node
+  // with no history.
+  const liveHeightRef = useRef<Map<Element, number>>(new Map())
 
   /** Last observed scroller clientHeight, so a viewport resize has a direction. */
   const viewportHeightRef = useRef(0)
@@ -362,19 +388,29 @@ export function useRowMeasurement<T>(ctx: {
       // because re-showing the ancestor fires the observer again with the
       // real size.
       if (newH <= 0) continue
+      // What the DOM showed for this node at its last fire, then this one:
+      // read whether or not the scope may be written.
+      const live = liveHeightRef.current
+      const prevLive = live.get(entry.target)
+      live.set(entry.target, newH)
       // Resolved at call time, never captured: a callback that closed over the
       // owner would keep writing into the PREVIOUS session's heights after a
       // slot switch -- the same wrong-transcript class this owner exists to
-      // close, reintroduced through a stale closure.
-      const hi = heightIndexRef.current
-      if (!hi) continue
+      // close, reintroduced through a stale closure. Null while the width
+      // transition is unsettled: the cache keeps the old width's height, and
+      // ONLY the write below stands down for it.
+      const hi = measurementIndex()
       // readMeasured (promoting): this row is mounted, so the read is genuine
       // access. `undefined` MUST stay reachable here -- the branch below tells
       // a first mount apart from a genuine resize by exactly that, so a
       // resolved height would classify every scroll-driven mount as a resize.
-      const prevH = hi.readMeasured(idx)
+      const prevCached = hi?.readMeasured(idx)
+      if (hi && prevCached !== newH) hi.setMeasured(idx, newH)
+      // Classify against what the DOM showed last; a node with no live height
+      // (its seed measured 0 under a hidden ancestor) falls back to the owner's
+      // measurement.
+      const prevH = prevLive ?? prevCached
       if (prevH !== newH) {
-        hi.setMeasured(idx, newH)
         // First-mount (prev undefined) happens during scroll-driven window
         // expansion; re-pinning then would interrupt the user's scroll. Only
         // genuine resizes (streaming growth, widget load) drive the pin —
@@ -448,7 +484,7 @@ export function useRowMeasurement<T>(ctx: {
       }
     }
     return { genuineResize, firstMount, viewportResized, tailRowResized, trailingChromeResized, streamingRowResized, aboveFoldReprice }
-  }, [elIndexRef, itemsRef, heightIndexRef, streamingIndexRef, graceIndexRef, trailingRef])
+  }, [elIndexRef, itemsRef, measurementIndex, streamingIndexRef, graceIndexRef, trailingRef])
 
   // ---- measureRef: per-item ref callback (memoized per index) ----
   //
@@ -474,6 +510,9 @@ export function useRowMeasurement<T>(ctx: {
       for (const [oldEl, oldIdx] of elIndexRef.current.entries()) {
         if (oldIdx === index && oldEl !== el) {
           elIndexRef.current.delete(oldEl)
+          // The node's live height goes with it: a remount is a new node, and a
+          // re-keyed row is re-seeded below in this same commit.
+          liveHeightRef.current.delete(oldEl)
           ro?.unobserve(oldEl)
         }
       }
@@ -488,9 +527,13 @@ export function useRowMeasurement<T>(ctx: {
         const it = itemsRef.current[index]
         if (it) {
           const h = measureBorderBoxHeight(el)
+          // Recorded even while the gate refuses the cache write below, so the
+          // observer's first fire on this node is classified against the height
+          // shown at mount rather than as a first mount.
+          if (h > 0) liveHeightRef.current.set(el, h)
           // Owner resolved at call time, not captured -- see the ResizeObserver
           // callback above for why a closed-over owner is a wrong-session write.
-          const hi = heightIndexRef.current
+          const hi = measurementIndex()
           if (hi && h > 0 && hi.readMeasured(index) !== h) {
             hi.setMeasured(index, h)
             // Eager (per the option): this branch fires at most once per row
@@ -509,7 +552,21 @@ export function useRowMeasurement<T>(ctx: {
     }
     cache.set(index, fn)
     return fn
-  }, [scheduleHeightSync, resizeObserverRef, elIndexRef, itemsRef, heightIndexRef, eagerFirstMeasureRef])
+  }, [scheduleHeightSync, resizeObserverRef, elIndexRef, itemsRef, measurementIndex, eagerFirstMeasureRef])
+
+  // A scope switch does not remount stable row refs, and the observer may have
+  // already reported their new size while the old scope was still active (and
+  // was refused above). Seed the new owner from live DOM; never copy the
+  // refused measurements across scopes.
+  const reseedMounted = useCallback(() => {
+    const hi = measurementIndex()
+    if (!hi) return
+    for (const [node, index] of elIndexRef.current) {
+      const height = measureBorderBoxHeight(node as HTMLElement)
+      if (height > 0 && hi.peekMeasured(index) !== height) hi.setMeasured(index, height)
+    }
+    scheduleHeightSync(false)
+  }, [measurementIndex, elIndexRef, scheduleHeightSync])
 
   // ---- Measure-farm API ----
   // Background off-screen measurement writes real heights for rows the
@@ -542,7 +599,7 @@ export function useRowMeasurement<T>(ctx: {
     if (index >= r.start && index < r.end) return false
     const it = itemsRef.current[index]
     if (!it || getKeyRef.current(it, index) !== key) return false
-    const hi = heightIndexRef.current
+    const hi = measurementIndex()
     if (!hi) return false
     if (hi.readMeasured(index) !== px) {
       hi.setMeasured(index, px)
@@ -551,7 +608,26 @@ export function useRowMeasurement<T>(ctx: {
       scheduleHeightSync(false)
     }
     return true
-  }, [scheduleHeightSync, windowRangeRef, itemsRef, getKeyRef, heightIndexRef])
+  }, [scheduleHeightSync, windowRangeRef, itemsRef, getKeyRef, measurementIndex])
 
-  return { measureResizeEntries, measureRef, farmIsMeasured, farmRecord, farmRowMounted }
+  return { measureResizeEntries, measureRef, farmIsMeasured, farmRecord, farmRowMounted, reseedMounted }
+}
+
+/** Reseed mounted rows when the height scope or its measurement gate changes.
+ *
+ * Called by the facade after the reading-position restore, so the slot-entry
+ * placement and every compensation of the commit have already run: this only
+ * writes measurements and schedules the debounced (anchor-compensated) sync,
+ * never a scroll position. */
+export function useMeasurementScopeReseed(ctx: {
+  heightIndex: HeightIndex
+  canMeasure: (() => boolean) | undefined
+  measurement: Pick<RowMeasurement, 'reseedMounted'>
+}): void {
+  const { heightIndex, canMeasure } = ctx
+  const { reseedMounted } = ctx.measurement
+  useLayoutEffect(() => {
+    if (!canMeasure) return
+    reseedMounted()
+  }, [heightIndex, canMeasure, reseedMounted])
 }

@@ -112,7 +112,7 @@ import { useFollowState, usePinning, useFollowPlacementPins } from './followPoli
 import { useWindowState, useWindowOperations, useCoverageWatchdog, useWindowEdgeTriggers } from './windowRange'
 import { useShiftCapture, useShiftCompensation } from './shiftCompensation'
 import { useReadingPositionEntry, useVisibilityReplacement, useReadingPositionRestore } from './readingPosition'
-import { useHeightOwner, useRowMeasurement } from './measurement'
+import { useHeightOwner, useRowMeasurement, useMeasurementScopeReseed } from './measurement'
 import { useStreamingSettleGrace, useGeometrySync } from './geometryScheduling'
 
 // The hook's public helpers, defined where their rules live and re-exported
@@ -130,6 +130,7 @@ export function useVirtualChat<T>(
     getKey,
     sessionId,
     heightScopeKey,
+    canMeasure,
     estimatedHeight = DEFAULT_ESTIMATED,
     overscan = DEFAULT_OVERSCAN,
     followOutput = true,
@@ -297,7 +298,7 @@ export function useVirtualChat<T>(
   const sync = useGeometrySync({ itemsRef, eagerFirstMeasureRef, heightIndexRef, shift, follow, pinning, ops })
   const measurement = useRowMeasurement({
     itemsRef, getKeyRef, streamingIndexRef, eagerFirstMeasureRef, elIndexRef, resizeObserverRef,
-    trailingRef, heightIndexRef, windowRangeRef, grace, sync,
+    trailingRef, heightIndexRef, canMeasure, windowRangeRef, grace, sync,
   })
 
   // Layout effects, pre-paint: the shift compensation's consumers, then
@@ -322,13 +323,16 @@ export function useVirtualChat<T>(
     topSentinelRef, bottomSentinelRef, onTopReachedRef, itemsRef, setWindowRange,
   })
 
-  // The slot-entry placement: the LAST layout effect, after every compensation
-  // and pin of the same commit.
+  // The slot-entry placement: the last layout effect that can place the reader,
+  // after every compensation and pin of the same commit.
   useReadingPositionRestore({
     sessionId, scrollerEl, itemCount, overscan, initialPlacement, followOutput, scrollerRef, elIndexRef,
     itemsRef, getKeyRef, getStableIdRef, heightIndexRef, getH, findAnchorIndex, anchoredRowIdentity,
     setWindowRange, setIsAtBottom, reading, shift, follow, pinning,
   })
+  // After placement: a width-scope change seeds the new owner from mounted rows
+  // (measurements only; the debounced sync owns any geometry that follows).
+  useMeasurementScopeReseed({ heightIndex, canMeasure, measurement })
 
   // ---- Recompute window when item count changes ----
   const { recomputeWindow } = ops
