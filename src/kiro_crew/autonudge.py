@@ -452,14 +452,25 @@ def _resolve_beat(beat: "asyncio.Future[None]") -> None:
 async def _await_future_deferring_cancellation(
     future: "asyncio.Future[Any]",
 ) -> tuple[Any, bool]:
-    """Join *future* and report cancellation only after its result is known."""
+    "Join *future* and report cancellation only after its result is known."
     cancelled = False
     while not future.done():
         try:
             await asyncio.shield(future)
         except asyncio.CancelledError:
             cancelled = True
-    return future.result(), cancelled
+        except Exception:
+            # Retain the joined error until cancellation precedence is known.
+            break
+    task = asyncio.current_task()
+    cancelled = cancelled or bool(task is not None and task.cancelling())
+    try:
+        result = future.result()
+    except BaseException as error:
+        if cancelled:
+            raise asyncio.CancelledError from error
+        raise
+    return result, cancelled
 
 
 # Persisted source category for a deliberate ``autonudge_stop`` directive.
@@ -1751,7 +1762,7 @@ class AutoNudgeService:
         # separately: self-arm trust remains on the historical deferred path,
         # while owner admission must be gone before the prior row disappears.
         self._deferred_monitor_replacements: dict[
-            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any]
+            str, tuple[NudgeLoop | None, NudgeLoop, bool, Any, NudgeLoop | None]
         ] = {}
         # Runtime turn-start evidence for the narrow window between a channel
         # accepting a claimed wake and the controller persisting DISPATCHED.
@@ -2844,7 +2855,29 @@ class AutoNudgeService:
                 logger.warning("AutoNudge: detached add() failed", exc_info=t.exception())
 
         inner.add_done_callback(_finish)
-        result, cancelled = await _await_future_deferring_cancellation(inner)
+        try:
+            result, cancelled = await _await_future_deferring_cancellation(inner)
+        except BaseException as add_error:
+            root_error = (
+                add_error.__cause__
+                if isinstance(add_error, asyncio.CancelledError) and add_error.__cause__ is not None
+                else add_error
+            )
+            if isinstance(root_error, OSError):
+                pending = self._find_by_slot(slot_key)
+                if pending is not None and pending.id in self._deferred_monitor_replacements:
+                    try:
+                        await self.rollback_monitor_replacement(pending.id)
+                    except BaseException as rollback_error:
+                        logger.error(
+                            "AutoNudge: committed replacement %s could not be rolled back",
+                            pending.id,
+                            exc_info=rollback_error,
+                        )
+                        if isinstance(add_error, asyncio.CancelledError):
+                            raise asyncio.CancelledError from rollback_error
+                        raise rollback_error from root_error
+            raise
         if cancelled:
             raise asyncio.CancelledError
         return result
@@ -3058,6 +3091,7 @@ class AutoNudgeService:
                             deepcopy(loop),
                             restore_prior_provider_credentials,
                             prior_owner_revocation,
+                            existing,
                         )
                     else:
                         transaction_cancelled = (
@@ -3071,6 +3105,7 @@ class AutoNudgeService:
                         None,
                         deepcopy(loop),
                         False,
+                        None,
                         None,
                     )
                 self._loops[loop.id] = loop
@@ -3098,6 +3133,7 @@ class AutoNudgeService:
                     replacement,
                     _restore_prior_provider_credentials,
                     prior_owner_revocation,
+                    _original_prior,
                 ) = pending
                 current = self._loops.get(loop_id)
                 if current is None or self._serialize_loop(current) != self._serialize_loop(
@@ -3133,6 +3169,7 @@ class AutoNudgeService:
                     replacement,
                     restore_prior_provider_credentials,
                     prior_owner_revocation,
+                    original_prior,
                 ) = self._deferred_monitor_replacements[loop_id]
                 current = self._loops.get(loop_id)
                 if current is None or self._serialize_loop(current) != self._serialize_loop(
@@ -3160,6 +3197,7 @@ class AutoNudgeService:
                         replacement,
                         restore_prior_provider_credentials,
                         prior_owner_revocation,
+                        original_prior,
                     )
                     raise
                 payload = {
@@ -3186,6 +3224,7 @@ class AutoNudgeService:
                         replacement,
                         restore_prior_provider_credentials,
                         prior_owner_revocation,
+                        original_prior,
                     )
                     raise
                 self._deferred_monitor_replacements.pop(loop_id, None)
@@ -3197,6 +3236,10 @@ class AutoNudgeService:
                 if removed is not None:
                     self._revoke_self_arm_for(removed)
                 if prior is not None:
+                    if original_prior is not None and self._serialize_loop(
+                        original_prior
+                    ) == self._serialize_loop(prior):
+                        prior = original_prior
                     self._loops[prior.id] = prior
                     transaction_cancelled = (
                         await self._rollback_trust_after_failed_removal(
@@ -3294,6 +3337,7 @@ class AutoNudgeService:
         validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         transaction_cancelled = False
+        finalize_error: BaseException | None = None
         async with self._lock:
             if admission_check is not None and not admission_check():
                 raise NudgeAdmissionRefused("session changed before nudge arm committed")
@@ -3451,16 +3495,43 @@ class AutoNudgeService:
                     if existing.active:
                         self._arm_from_deadline(existing)
                 raise
-            self._arm_from_deadline(loop)
             if existing is not None:
-                transaction_cancelled = (
-                    await self._commit_owner_revocation(existing_owner_revocation)
-                    or transaction_cancelled
-                )
-                # Committed: the displaced row is gone from the store, so its
-                # self-arm entry is revoked now, not before the write.
-                self._revoke_self_arm_for(existing)
-                self._emit("removed", existing)
+                try:
+                    transaction_cancelled = (
+                        await self._commit_owner_revocation(existing_owner_revocation)
+                        or transaction_cancelled
+                    )
+                except (MonitorUpdateConflict, OSError, asyncio.CancelledError) as error:
+                    # The durable replacement must stay byte-for-value while trust
+                    # is unresolved. Deferred-replacement guards keep it unarmed
+                    # and immutable until this method leaves the service lock.
+                    self._deferred_monitor_replacements[loop.id] = (
+                        deepcopy(existing),
+                        deepcopy(loop),
+                        restore_existing_provider_credentials,
+                        existing_owner_revocation,
+                        existing,
+                    )
+                    logger.error(
+                        "AutoNudge: replacement %s committed but owner admission "
+                        "finalization for displaced loop %s failed; replacement "
+                        "held unarmed for rollback or startup recovery",
+                        loop.id,
+                        existing.id,
+                        exc_info=True,
+                    )
+                    finalize_error = error
+                else:
+                    # Committed: the displaced row is gone from the store, so its
+                    # self-arm entry is revoked now, not before the write.
+                    self._revoke_self_arm_for(existing)
+                    self._emit("removed", existing)
+            if finalize_error is None:
+                self._arm_from_deadline(loop)
+        if finalize_error is not None:
+            if transaction_cancelled or isinstance(finalize_error, asyncio.CancelledError):
+                raise asyncio.CancelledError from finalize_error
+            raise finalize_error
         self._emit("added", loop)
         logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
         if transaction_cancelled:
@@ -3671,6 +3742,7 @@ class AutoNudgeService:
         if max_runtime_secs is not None:
             validate_runtime_secs(max_runtime_secs, allow_unbounded=True)
         async with self._lock:
+            self._assert_monitor_replacement_mutable(loop_id)
             loop = self._loops.get(loop_id)
             if not loop:
                 # Inside the hold, so the caller can inspect the slot before any
@@ -4141,14 +4213,19 @@ class AutoNudgeService:
     ) -> tuple[Any, bool]:
         """Fence owner admission and revoke provider trust before store deletion."""
         from kiro_crew import autonudge_selfarm
+        from kiro_crew.members import is_member_session_key
 
-        exact_row = durable_loop_row or self._durable_loop_row(loop)
-        owner_revocation, cancelled = await autonudge_selfarm.await_thread_deferring_cancellation(
-            autonudge_selfarm.begin_owner_arm_revocation,
-            loop.id,
-            loop.slot_key,
-            exact_row,
-        )
+        owner_revocation, cancelled = None, False
+        if is_member_session_key(loop.slot_key):
+            exact_row = durable_loop_row or self._durable_loop_row(loop)
+            owner_revocation, cancelled = (
+                await autonudge_selfarm.await_thread_deferring_cancellation(
+                    autonudge_selfarm.begin_owner_arm_revocation,
+                    loop.id,
+                    loop.slot_key,
+                    exact_row,
+                )
+            )
         restore_provider_credentials = False
         try:
             restore_provider_credentials = await self._provider_credentials_authorized(loop)
@@ -6309,6 +6386,8 @@ class AutoNudgeService:
             return
         eligible: set[str] = set()
         for loop in list(self._loops.values()):
+            if loop.id in self._deferred_monitor_replacements:
+                continue
             # Mirror _timer's own re-arm guard, not a stricter one: an
             # INACTIVE loop still waiting for terminal-completion evidence
             # owns a finite accepted-turn correlation whose expiry needs a
