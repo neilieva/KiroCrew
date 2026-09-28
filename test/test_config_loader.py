@@ -6,6 +6,7 @@ for property-based testing.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -3655,10 +3656,17 @@ class TestConfigCache:
         assert second.agent.model == "model-bbbb"
 
     def test_atomic_replacement_identity_busts_same_size_fingerprint(self, tmp_path: Path) -> None:
-        """Atomic mode writes differ even when legacy fingerprint fields match."""
+        """Atomic mode writes differ even when legacy fingerprint fields match.
+
+        Pinned to the tmp+rename publish: ``config_path()`` is patched at
+        ``cfg_file``, which on Linux would make it one of the two sealed files and
+        route it through the in-place writer (same inode by design), so
+        ``IS_LINUX`` is forced off to keep this a rename-identity test.
+        """
         import os as _os
         from unittest.mock import patch
 
+        from kiro_crew import platform_compat
         from kiro_crew.config.loader import (
             _config_fingerprint,
             update_config_locked,
@@ -3672,6 +3680,7 @@ class TestConfigCache:
             "dashboard": {"default_memory_mode": "incognito"},
         }
         with (
+            patch.object(platform_compat, "IS_LINUX", False),
             patch("kiro_crew.config.loader.config_path", return_value=cfg_file),
             patch("kiro_crew.config.loader.config_local_path", return_value=local),
         ):
@@ -7081,6 +7090,43 @@ class TestMigrationWriteBackOrdering:
             if migrator.is_alive():
                 migrator.join(timeout=self._TIMEOUT)
             os.close(lock_fd)
+
+    def test_a_load_on_the_event_loop_defers_the_migration(self, tmp_path: Path) -> None:
+        """A running loop on this thread means no synchronous write-back.
+
+        The write-back is file I/O, and on Linux the sealed config is written in
+        place with an ``fsync``, so on the loop it declines exactly like a held
+        lock: returns False, touches nothing, and the next off-loop load writes.
+        """
+        cfg_path = self._owned_config(tmp_path)
+        stored = self._legacy_config()
+        cfg_path.write_text(json.dumps(stored), encoding="utf-8")
+
+        async def _on_loop() -> bool:
+            with unittest.mock.patch.object(
+                loader_module, "config_dir", return_value=cfg_path.parent
+            ):
+                return loader_module._persist_config_migration(
+                    cfg_path,
+                    frozenset({loader_module.MIGRATE_AGENTS}),
+                    default_kiro_agent="kirocrew",
+                )
+
+        assert asyncio.run(_on_loop()) is False
+        assert json.loads(cfg_path.read_text(encoding="utf-8")) == stored
+        assert not Path(str(cfg_path) + ".bak").exists()
+
+        # Off the loop the same call migrates, so the deferral converges.
+        with unittest.mock.patch.object(loader_module, "config_dir", return_value=cfg_path.parent):
+            assert (
+                loader_module._persist_config_migration(
+                    cfg_path,
+                    frozenset({loader_module.MIGRATE_AGENTS}),
+                    default_kiro_agent="kirocrew",
+                )
+                is True
+            )
+        assert "agents" in json.loads(cfg_path.read_text(encoding="utf-8"))
 
     def test_a_symlink_out_of_the_data_home_gets_no_lock_sidecar(self, tmp_path: Path) -> None:
         """Containment is about where the sidecar LANDS, not where the path sits.

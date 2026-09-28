@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2161,9 +2162,12 @@ class TestReplayOnRegistration:
     @staticmethod
     def _write_settled(path: Path, doc: dict) -> None:
         """Write *doc* and let the loader's migration write-back land now, so the
-        file's fingerprint afterwards is the one the watcher records."""
+        file's fingerprint afterwards is the one the watcher records. The load
+        runs on a worker thread: on the event loop the write-back is deferred."""
         _write(path, doc)
-        KiroCrewConfig.load()
+        settle = threading.Thread(target=KiroCrewConfig.load)
+        settle.start()
+        settle.join()
 
     @pytest.mark.asyncio
     async def test_a_reload_that_missed_the_registration_is_replayed(self, cfg_file: Path) -> None:
