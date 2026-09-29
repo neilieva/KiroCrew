@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import { useAppDispatch } from '../store'
 import { cancelQueuedMessage, editQueuedMessage, queueEntryAttachments } from '../store/chatSlice'
 import { restoreQueuedContent } from '../utils/fileTokens'
+import type { MessageQuote } from '../chat-core/composer/messageQuote'
 import type { ChatMessage } from '../types'
 
 /** Pre-serialization composer state of a send the server QUEUED, written by the
@@ -22,6 +23,10 @@ export interface QueuedSendRecord {
    *  mention was invisible to reconciliation, so hand-deleting it left a
    *  stale chip that the next send silently re-attached. */
   aliases?: Record<string, string[]>
+  /** The whole-message quote the send consumed (`chat-core/composer/messageQuote`),
+   *  so a cancel puts it back as a staged card rather than leaving its `>` block
+   *  in the restored text -- or, without a stash hit, losing it (fork GPT review). */
+  quote?: MessageQuote
 }
 
 /** Queued-send stash, keyed by the `queue_id` the send receipt returns (the
@@ -75,7 +80,7 @@ export interface QueuedMessageActionsOptions {
    *  Omitted, the recovered state is dropped, which is what cancelling in a
    *  split pane did before #5891 and what no host should do.
    */
-  restoreDraft?: (text: string, files: string[], aliases?: Record<string, string[]>) => void
+  restoreDraft?: (text: string, files: string[], aliases?: Record<string, string[]>, quote?: MessageQuote) => void
 }
 
 const queueIdOf = (m: ChatMessage): string | undefined => m.meta?.queueId as string | undefined
@@ -216,7 +221,8 @@ export function useQueuedMessageActions({
       // The stash also carries the alias map the send-clear dropped; the
       // parser fallback cannot know it, and a restore without aliases falls
       // into the documented reload-limitation class rather than corrupting.
-      restoreDraftRef.current?.(text, files, hit ? stashed.aliases : undefined)
+      if (hit && stashed.quote) restoreDraftRef.current?.(text, files, stashed.aliases, stashed.quote)
+      else restoreDraftRef.current?.(text, files, hit ? stashed.aliases : undefined)
     }
     // Optimistically remove the card; the WS echo is a no-op if already gone.
     dispatch(cancelQueuedMessage({ slot, queue_id: queueId }))

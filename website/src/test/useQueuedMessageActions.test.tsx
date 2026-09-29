@@ -127,6 +127,17 @@ describe('useQueuedMessageActions — cancel', () => {
     expect(queuedSendStash.has('q1')).toBe(false)
   })
 
+  it('a stash hit hands the consumed whole-message quote back, so the host restages the card', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't1' }
+    const sent = '> the quoted reply\n> — quoting an earlier message from the assistant\n\nwhy?'
+    const restoreDraft = vi.fn()
+    const rows = [queued('q1', sent)]
+    queuedSendStash.set('q1', { raw: 'why?', files: [], sent, quote })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote)
+  })
+
   it('a stash hit hands the alias map back so restored mentions stay reconciled (fork GPT review)', () => {
     // Restoring text + files WITHOUT the recorded aliases re-created the
     // pre-fix stuck chip: the restored mention was invisible to the
