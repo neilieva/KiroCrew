@@ -13,7 +13,7 @@ import { useCommandCenter } from './useCommandCenter'
  * lives in the existing panel, which already owns dock/expand/mobile behaviour. */
 function CommandCenterDock({ slot, onOpen }: { slot: string | null; onOpen: () => void }) {
   useLanguageGeneration()
-  const data = useCommandCenter(slot)
+  const data = useCommandCenter(slot, true, 'task', { dock: true })
   const [collapsed, setCollapsed] = usePersistedBool('mc-task-dashboard-collapsed', false)
   const reducedMotion = useReducedMotion()
   if (!data.relevant) return null
@@ -31,9 +31,13 @@ function CommandCenterDock({ slot, onOpen }: { slot: string | null; onOpen: () =
       {data.stale ? <div className="px-3 pb-2">
         {/* No hand-off: the adjacent chat composer and panel can hold unsent answer drafts. */}
         <ErrorNotice message={i18nT('commandCenter.stale')} />
-      </div> : <p className="px-3 pb-2 text-[12px] text-muted" aria-live="polite">
-        {i18nT('commandCenter.summary', { running: fmtNumber(data.running), blocked: fmtNumber(data.blocked), approvals: fmtNumber(data.approvalCount) })}
-      </p>}
+      </div> : <>
+        <p className="px-3 pb-2 text-[12px] text-muted" aria-live="polite">
+          {i18nT('commandCenter.summary', { running: fmtNumber(data.running), blocked: fmtNumber(data.blocked), approvals: fmtNumber(data.approvalCount) })}
+        </p>
+        {/* No hand-off: decisions above are fresh; the adjacent composer can hold drafts. */}
+        {data.partial && <div className="px-3 pb-2"><ErrorNotice message={i18nT('commandCenter.stale')} /></div>}
+      </>}
     </motion.div>
   </motion.div>
 }

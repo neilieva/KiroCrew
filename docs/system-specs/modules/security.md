@@ -2681,7 +2681,8 @@ for older approval surfaces. These selectors narrow resolution, not authorizatio
 or permission mode; the existing caller gates still run first.
 
 The host approval card displays the redacted `tool_purpose` from that exact
-native permission event or coordinator inventory record, never a reason inferred
+native permission event (read from the params the preceding `tool_call` cached,
+else the permission frame's own `rawInput`) or coordinator inventory record, never a reason inferred
 from the command, title, or session task. An absent reason is explicitly missing.
 Coordinator slot projections redact the full purpose before applying the existing
 8,000-byte UTF-8 display cap, with a visible truncation notice. Native purposes

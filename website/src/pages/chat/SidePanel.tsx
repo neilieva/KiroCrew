@@ -987,7 +987,9 @@ export default function SidePanel({
           // The pinned Files tab renders the file-browser home directly — it
           // is not one of ActivityViewer's multiplexed session views.
           if (t.kind === 'files') {
-            if (!isActive) return null
+            // A panel kept mounted but hidden (a Dynamic Dashboard or app tab holds it)
+            // must not keep these bodies polling: they unmount as a closed panel's did.
+            if (!isActive || panelHidden) return null
             return (
               <div key={t.id} className="absolute inset-0">
                 <FilesHomePanel
@@ -1005,7 +1007,9 @@ export default function SidePanel({
             )
           }
           if (VIEW_KINDS.has(t.kind)) {
-            if (!isActive) return null
+            // A panel kept mounted but hidden (a Dynamic Dashboard or app tab holds it)
+            // must not keep these bodies polling: they unmount as a closed panel's did.
+            if (!isActive || panelHidden) return null
             return (
               <div key={t.id} className="absolute inset-0">
                 <ActivityViewer

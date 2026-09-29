@@ -13,14 +13,16 @@ from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_k
 from kiro_crew.dashboard.dynamic_cards import (
     MAX_INPUT_CHARS,
     MAX_OUTPUT_BYTES,
+    RESTORED,
     CardEntry,
     CardPublisher,
     normalize_card,
 )
-from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
+from kiro_crew.history import TranscriptBusy, TranscriptWithheld, is_incognito_transcript
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.security.redaction import redact_credentials_with_records
+from kiro_crew.session_summary import _is_injected
 
 _PROMPT = """Create this session's concise status card, in the user's language.
 Explain what was done, what the evidence means, and what comes next. The supplied
@@ -39,14 +41,30 @@ exactly the same field names. If previous contains only fields, the host retains
 the layout; return data for every listed field. Changing fields requires explicit
 replacement html. Do not regenerate layout merely because progress changed.
 This is a bounded recent-window update, not an authoritative full-history summary.
+A message with role "automation" was injected by a scheduler or another agent, not
+typed by the user; never present it as the user's request or decision.
 """
+
+#: Roles that can carry evidence for a card. Filtered BEFORE the recent window
+#: is sliced, so a long run of tool rows cannot push every usable row out of it.
+_EVIDENCE_ROLES = frozenset({"user", "assistant", "error", "tool_result"})
+#: Rows read from the transcript, and serialized characters of evidence kept.
+_EVIDENCE_ROWS = 32
+_EVIDENCE_CHARS = 6000
 
 
 def _redact(text: str) -> str:
     return redact_credentials(redact_exfiltration_urls(text)[0])[0]
 
 
-_TAG = re.compile(r"<[^>]*>")
+#: A tag opens only where the HTML tokenizer opens one: ``<`` followed by a
+#: letter, ``/``, ``!`` or ``?``. Any other ``<`` is text a browser shows, so a
+#: pattern that swallowed it would also swallow the first half of a credential.
+#: A comment is one unit, ended where the HTML tokenizer ends one: at once by
+#: ``>`` or ``->`` (``<!-->``, ``<!--->``), else at the first ``-->`` or
+#: ``--!>``, else at the end of input. A bare ``>`` inside does not close it,
+#: and the browser shows none of it.
+_TAG = re.compile(r"<!--(?:>|->|[\s\S]*?(?:--!?>|$))|<(?=[A-Za-z/!?])[^>]*>")
 
 
 def _html_texts(markup: str) -> tuple[str, str]:
@@ -99,6 +117,11 @@ def _redact_card_output(text: str, previous: dict | None) -> dict | None:
         return None
     data = {}
     for key, value in raw["data"].items():
+        # A count or a flag is text once bound; refusing it failed the card.
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            value = str(value)
         if not isinstance(key, str) or not isinstance(value, str) or _redact(key) != key:
             # Renaming a sensitive key would corrupt layout bindings or collide.
             return None
@@ -128,6 +151,53 @@ def _redact_card_output(text: str, previous: dict | None) -> dict | None:
         if _redact(interpreted) != interpreted:
             return None
     return payload
+
+
+def _evidence_rows(messages: list[dict]) -> list[dict]:
+    """The newest redacted rows that fit the evidence budget, newest first.
+
+    CPU-bound scanning, run in a worker thread rather than on the gateway loop:
+    a window of large rows costs seconds of regex work.
+    """
+    rows: list[dict] = []
+    # Reserve recent evidence independently of the previous layout. Count
+    # serialized rows, including escapes, instead of unencoded text lengths.
+    remaining = _EVIDENCE_CHARS
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role not in _EVIDENCE_ROLES:
+            continue
+        raw = msg.get("content")
+        # A huge tool result is omitted, not scanned or sliced through a
+        # credential. The source window itself has a CPU/memory budget.
+        if not isinstance(raw, str) or len(raw) > MAX_INPUT_CHARS:
+            continue
+        # A message whose markup holds a labelled credential apart from its
+        # label is omitted whole, like an oversized one: the raw scan takes
+        # the tag for the value and leaves the real one in place, and the
+        # model must not see it. Judged before that scan, which would strip
+        # the label the projection needs.
+        if _hides_secret(raw):
+            continue
+        # A scheduler's or another agent's injected envelope is not the user.
+        if role == "user" and _is_injected(raw):
+            role = "automation"
+        text = _redact(raw)
+        low, high = 0, min(len(text), remaining)
+        while low < high:
+            mid = (low + high + 1) // 2
+            candidate = {"role": role, "text": text[:mid]}
+            if len(json.dumps(candidate, ensure_ascii=False)) + 2 <= remaining:
+                low = mid
+            else:
+                high = mid - 1
+        if low:
+            row = {"role": role, "text": text[:low]}
+            rows.append(row)
+            remaining -= len(json.dumps(row, ensure_ascii=False)) + 2
+        if low < len(text):
+            break
+    return rows
 
 
 class CardLifecycle:
@@ -166,7 +236,7 @@ class CardLifecycle:
         for slot in self.state._slots.values():
             if len(self.publisher.entries) >= self.publisher.budget.capacity:
                 break
-            self.notify(slot, "restored")
+            self.notify(slot, RESTORED)
 
     @staticmethod
     def _eligible(slot: Any) -> bool:
@@ -179,6 +249,7 @@ class CardLifecycle:
             or getattr(slot, "executor", "") == "remote"
             or is_incognito_transcript(getattr(slot, "memory_mode", ""))
             or bool(getattr(slot, "_created_by", ""))
+            or bool(getattr(slot, "_dashboard_card_exempt", False))
         )
 
     def _valid(self, entry: CardEntry) -> bool:
@@ -211,6 +282,10 @@ class CardLifecycle:
                 and (current is None or current._dashboard_card_identity != entry.owner)
             ):
                 self.publisher.forget(slot.key)
+            return
+        # A slot being rebuilt from history replays rows it already had: that is
+        # browsing, not activity, and queues no model work.
+        if slot.key in getattr(self.state, "_slots_under_construction", ()):
             return
         if not slot.messages or not self._eligible(slot):
             self.publisher.forget(slot.key)
@@ -275,7 +350,10 @@ class CardLifecycle:
                 source = validate_source()
                 # The persisted transcript, not a possibly stale UI message
                 # cache after a rewrite, owns the evidence for derived content.
-                return log.derive_recent(key, max_messages=32), source
+                return (
+                    log.derive_recent(key, max_messages=_EVIDENCE_ROWS, roles=_EVIDENCE_ROLES),
+                    source,
+                )
 
         messages, source = await asyncio.to_thread(source_snapshot)
         if entry.published_source is not None and entry.published_source != source:
@@ -283,40 +361,7 @@ class CardLifecycle:
             entry.published_at = None
             entry.content_event_at = None
             entry.published_source = None
-        rows = []
-        # Reserve recent evidence independently of the previous layout. Count
-        # serialized rows, including escapes, instead of unencoded text lengths.
-        remaining = 6000
-        for msg in reversed(messages):
-            if msg.get("role") not in {"user", "assistant", "error", "tool_result"}:
-                continue
-            raw = msg.get("content")
-            # A huge tool result is omitted, not scanned or sliced through a
-            # credential. The source window itself has a CPU/memory budget.
-            if not isinstance(raw, str) or len(raw) > MAX_INPUT_CHARS:
-                continue
-            # A message whose markup holds a labelled credential apart from its
-            # label is omitted whole, like an oversized one: the raw scan takes
-            # the tag for the value and leaves the real one in place, and the
-            # model must not see it. Judged before that scan, which would strip
-            # the label the projection needs.
-            if _hides_secret(raw):
-                continue
-            text = _redact(raw)
-            low, high = 0, min(len(text), remaining)
-            while low < high:
-                mid = (low + high + 1) // 2
-                candidate = {"role": msg["role"], "text": text[:mid]}
-                if len(json.dumps(candidate, ensure_ascii=False)) + 2 <= remaining:
-                    low = mid
-                else:
-                    high = mid - 1
-            if low:
-                row = {"role": msg["role"], "text": text[:low]}
-                rows.append(row)
-                remaining -= len(json.dumps(row, ensure_ascii=False)) + 2
-            if low < len(text):
-                break
+        rows = await asyncio.to_thread(_evidence_rows, messages)
         if not rows:
             return None
 
@@ -341,13 +386,14 @@ class CardLifecycle:
             _PROMPT + context,
             model=cfg.agent.resolve_model("background"),
             sel_source="dynamic_dashboard_card",
-            crew_log_kind="summary",
+            crew_log_kind="dynamic_card",
             crew_log_session_key=effective_session_key(slot),
             max_output_bytes=MAX_OUTPUT_BYTES,
             retry_rejected_model=False,
             timeout=45,
         )
-        payload = _redact_card_output(text, entry.payload)
+        # Scanning model markup is CPU work that must not stall the gateway loop.
+        payload = await asyncio.to_thread(_redact_card_output, text, entry.payload)
         if payload is None or not self._valid(entry):
             return None
         # A rewrite/delete/privacy change wins over the model result. Append-only
@@ -378,10 +424,19 @@ class CardLifecycle:
         snapshot = self.publisher.read(slot.key) or empty
         source = entry.published_source
 
+        # Before the first flush, or while the transcript lock is contended, the
+        # producer's own status is still true; only its content is not yet
+        # provable. "unavailable" would read as permanent to the viewer.
+        pending = (
+            {**snapshot, "card": None, "published_at": None, "content_event_at": None}
+            if snapshot["status"] in {"queued", "generating", "budget"}
+            else empty
+        )
+
         def guarded_read() -> dict:
             with log.publication_hold(entry.binding):
                 if log.session_mtime(entry.binding) is None:
-                    return empty
+                    return pending
                 current = (
                     log.rotation_generation(entry.binding),
                     tuple(log.chained_keys(entry.binding) or [entry.binding]),
@@ -392,6 +447,8 @@ class CardLifecycle:
 
         try:
             result = await asyncio.to_thread(guarded_read)
+        except TranscriptBusy:
+            result = pending
         except TranscriptWithheld:
             return empty
         return (

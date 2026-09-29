@@ -99,6 +99,11 @@ class ApprovalCoordinator:
                 # Every exit -- decided, expired, cancelled -- leaves the record
                 # gone, so one push here takes the slot back out of the lane.
                 _push_slots(state)
+            elif future.cancelled() or not future.done():
+                # Superseded by a same-id request: its frame, record and slot
+                # lane now belong to the replacement and are left alone, but
+                # this wait still ended undecided and the audit trail says so.
+                state._audit_approval(slot or "state", approval_id, False, _EXPIRED_DECISION)
 
     @staticmethod
     def _retire_unresolved(state: Any, approval_id: str, slot_key: str) -> None:
@@ -121,7 +126,7 @@ class ApprovalCoordinator:
             )
 
     @staticmethod
-    def audit_and_broadcast(
+    def audit(
         state: Any,
         session_key: str,
         approval_id: str,
@@ -130,6 +135,7 @@ class ApprovalCoordinator:
         *,
         audit_provider: Callable[[], Any],
     ) -> None:
+        """Record one approval outcome in the SEL, without telling any client."""
         try:
             audit_provider().log_tool_invocation(
                 session_key=session_key,
@@ -140,6 +146,20 @@ class ApprovalCoordinator:
             )
         except Exception:
             state._log.warning("SEL audit failed for approval resolution", exc_info=True)
+
+    @staticmethod
+    def audit_and_broadcast(
+        state: Any,
+        session_key: str,
+        approval_id: str,
+        approved: bool,
+        decision: str,
+        *,
+        audit_provider: Callable[[], Any],
+    ) -> None:
+        ApprovalCoordinator.audit(
+            state, session_key, approval_id, approved, decision, audit_provider=audit_provider
+        )
         try:
             payload: dict = {"id": approval_id, "approved": approved}
             if session_key and session_key != "state":

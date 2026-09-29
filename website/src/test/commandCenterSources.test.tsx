@@ -118,6 +118,43 @@ describe('task dashboard sources and containment', () => {
     expect(teamRoots(slots, 'a')).toEqual(['a', 'b'])
   })
 
+  it('reads the work board from the dock only for a team, and never refetches on focus', async () => {
+    const initial = store().getState()
+    const solo = createTestStore({ ...initial, dashboard: { ...initial.dashboard, slots: [{ key: 'root', messages: 0, running: true }] } })
+    const dock = renderHookWithProviders(() => ({ ...useCommandCenter('root', true, 'task', { dock: true }), queryClient: useQueryClient() }), { store: solo })
+    await waitFor(() => expect(dock.result.current.loading).toBe(false))
+    expect(api.sessionWorkProjection).not.toHaveBeenCalled()
+    const own = (key: readonly unknown[]) => key[0] === 'command-center' || key[0] === 'global-approvals'
+    const observers = dock.result.current.queryClient.getQueryCache().getAll().filter(q => own(q.queryKey)).flatMap(q => q.observers)
+    expect(observers.length).toBeGreaterThan(0)
+    expect(observers.every(o => o.options.refetchOnWindowFocus === false)).toBe(true)
+    dock.unmount()
+    const team = renderHookWithProviders(() => useCommandCenter('root', true, 'task', { dock: true }), { store: store() })
+    await waitFor(() => expect(team.result.current.loading).toBe(false))
+    expect(api.sessionWorkProjection).toHaveBeenCalledWith('root')
+    team.unmount()
+    vi.mocked(api.sessionWorkProjection).mockClear()
+    const panel = renderHookWithProviders(() => useCommandCenter('root'), { store: solo })
+    await waitFor(() => expect(panel.result.current.loading).toBe(false))
+    expect(api.sessionWorkProjection).toHaveBeenCalledWith('root')
+  })
+
+  it('keeps decisions fresh when an optional source fails, and shares the app approvals cache', async () => {
+    vi.mocked(api.workflowRuns).mockRejectedValue(new Error('workflows not available'))
+    const { result } = renderHookWithProviders(() => ({ ...useCommandCenter('root'), queryClient: useQueryClient() }), { store: store() })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    await waitFor(() => expect(result.current.queryClient.getQueryState(['command-center', 'workflows'])?.status).toBe('error'))
+    expect(result.current.stale).toBe(false)
+    // The missing source is still reported, not passed off as "no runs".
+    expect(result.current.partial).toBe(true)
+    expect(result.current.updatedAt).toBeGreaterThan(0)
+    expect(result.current.queryClient.getQueryState(['global-approvals'])?.status).toBe('success')
+    vi.mocked(api.pendingQuestions).mockRejectedValue(new Error('offline'))
+    await act(async () => { await result.current.queryClient.refetchQueries({ queryKey: ['command-center', 'questions'] }) })
+    await waitFor(() => expect(result.current.stale).toBe(true))
+    expect(result.current.partial).toBe(false)
+  })
+
   it('retains only stateless drafts by exact normalized slot and card, clearing on scope changes', async () => {
     let root: string | null = 'root'
     let scope: 'task' | 'fleet' = 'task'

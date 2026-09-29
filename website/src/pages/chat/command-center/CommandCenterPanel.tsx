@@ -76,7 +76,7 @@ export default function CommandCenterPanel({ slot, active, publishedView, sessio
         { key: 'approvals', label: t('commandCenter.approvals'), icon: <ShieldCheck size={14} />, count: data.approvalCount },
       ]} />
       {/* No hand-off: pending QuestionCard answer drafts remain mounted below. */}
-      {data.stale && <ErrorNotice message={t('commandCenter.stale')} />}
+      {(data.stale || data.partial) && <ErrorNotice message={t('commandCenter.stale')} />}
       </div>
     </header>
     <div className="flex-1 min-h-0 overflow-y-auto">
