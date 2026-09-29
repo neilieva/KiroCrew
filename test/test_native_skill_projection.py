@@ -3419,3 +3419,113 @@ def test_reader_follows_a_live_global_preference_under_the_overlay(native_tree):
     assert projection.inherits_default_resources(project) is False
     settings.write_text('{"chat.disableInheritingDefaultResources":false}', encoding="utf-8")
     assert projection.inherits_default_resources(project) is True
+
+
+class TestSettingsReadRetry:
+    """A transiently refused ``cli.json`` read must not fail a new chat.
+
+    The gated read of a healthy settings file answers ``None`` when a writer
+    renames a new file over the one that was opened, or when the sensitive-path
+    resolver misses its budget under load. ``_settings`` retries through
+    a bounded retry; a read that stays refused still
+    raises.
+    """
+
+    @staticmethod
+    def _flaky_reader(monkeypatch, refusals):
+        real = projection.safe_read_file_bytes
+        calls = []
+
+        def flaky(raw):
+            calls.append(raw)
+            return None if len(calls) <= refusals else real(raw)
+
+        monkeypatch.setattr(projection, "safe_read_file_bytes", flaky)
+        return calls
+
+    def test_one_refusal_then_bytes_prepares_the_projection(self, native_tree, monkeypatch):
+        home, agents, project = native_tree
+        (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+        global_settings = home / "settings" / "cli.json"
+        global_settings.parent.mkdir(parents=True)
+        global_settings.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            projection,
+            "_settings_read_sleep",
+            lambda secs: pytest.fail(f"paused {secs}s for a re-check"),
+        )
+        calls = self._flaky_reader(monkeypatch, refusals=1)
+
+        prepared = projection.prepare_native_skill_projection(project)
+
+        assert prepared is not None and prepared.agent("custom")
+        assert calls[0] == calls[1] == str(global_settings)
+
+    def test_rollback_with_one_refusal_still_restores(self, native_tree, monkeypatch):
+        # KIROCREW_NATIVE_SKILL_PROJECTION=0 still reads the workspace cli.json
+        # during rollback, so the retry must cover that path too.
+        _home, agents, project = native_tree
+        (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+        settings = project / ".kiro/settings/cli.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text("{}", encoding="utf-8")
+        projection.prepare_native_skill_projection(project)
+        monkeypatch.setattr(projection, "_settings_read_sleep", lambda secs: None)
+        monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+        self._flaky_reader(monkeypatch, refusals=1)
+
+        assert projection.prepare_native_skill_projection(project) is None
+        assert json.loads(settings.read_text(encoding="utf-8")) == {}
+
+    def test_a_refusal_that_clears_after_the_pause_is_read(self, tmp_path, monkeypatch):
+        path = tmp_path / "cli.json"
+        path.write_text('{"a": 1}', encoding="utf-8")
+        slept = []
+        monkeypatch.setattr(projection, "_settings_read_sleep", slept.append)
+        calls = self._flaky_reader(monkeypatch, refusals=2)
+
+        assert projection._settings(path) == {"a": 1}
+        assert len(calls) == 3
+        assert slept == [2.0]
+
+    def test_a_read_that_stays_refused_still_raises(self, native_tree, monkeypatch):
+        home, agents, project = native_tree
+        (agents / "custom.json").write_text('{"name":"custom"}', encoding="utf-8")
+        global_settings = home / "settings" / "cli.json"
+        global_settings.parent.mkdir(parents=True)
+        global_settings.write_text("{}", encoding="utf-8")
+        slept = []
+        monkeypatch.setattr(projection, "_settings_read_sleep", slept.append)
+        calls = self._flaky_reader(monkeypatch, refusals=10**6)
+
+        with pytest.raises(ValueError, match="Cannot read Kiro settings"):
+            projection.prepare_native_skill_projection(project)
+        # First attempt, immediate re-check, one pause, final attempt.
+        assert len(calls) == 3
+        assert slept == [2.0]
+
+    def test_a_missing_file_reads_empty_without_retry(self, tmp_path, monkeypatch):
+        calls = self._flaky_reader(monkeypatch, refusals=10**6)
+        assert projection._settings(tmp_path / "absent.json") == {}
+        assert calls == []
+
+    def test_an_empty_file_is_not_mistaken_for_absence(self, tmp_path):
+        path = tmp_path / "cli.json"
+        path.write_bytes(b"")
+        with pytest.raises(ValueError):
+            projection._settings(path)
+
+    @pytest.mark.asyncio
+    async def test_on_the_event_loop_one_attempt_runs_and_never_pauses(self, tmp_path, monkeypatch):
+        path = tmp_path / "cli.json"
+        path.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            projection,
+            "_settings_read_sleep",
+            lambda secs: pytest.fail(f"paused {secs}s on the loop"),
+        )
+        calls = self._flaky_reader(monkeypatch, refusals=1)
+
+        with pytest.raises(ValueError, match="Cannot read Kiro settings"):
+            projection._settings(path)
+        assert len(calls) == 1

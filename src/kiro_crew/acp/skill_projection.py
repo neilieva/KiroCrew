@@ -32,9 +32,10 @@ from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.acp import session_mcp
 from kiro_crew.agent_discovery import SCOPE_PROJECT, _read_agent_spec, list_agents
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, on_event_loop
 from kiro_crew.config.paths import data_home, kiro_agents_dir, kiro_home, project_agents_dir
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
+from kiro_crew.security import _PATH_RESOLVE_TIMEOUT_SECS
 from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
 
 logger = logging.getLogger(__name__)
@@ -733,12 +734,51 @@ def _scan_projection_leases(directory: Path) -> tuple[set[str], bool]:
     return live_aliases, scan_capped or scan_expired
 
 
+_ABSENT_SETTINGS = object()
+
+#: Pauses before the retries of a refused ``cli.json`` read, in seconds; the
+#: first attempt runs before any of them. A healthy file is refused transiently
+#: in two ways: a writer renames a new file over the one that was opened (the
+#: descriptor check then names the unlinked inode), which clears on an immediate
+#: re-check, and a saturated sensitive-path resolver, which clears once a
+#: candidate resolution has had its full budget. No other refusal changes with
+#: time inside one call, so more pauses would only delay the fail-closed answer.
+_SETTINGS_READ_RETRY_PAUSES: tuple[float, ...] = (0.0, _PATH_RESOLVE_TIMEOUT_SECS)
+
+#: The pause primitive of :func:`_settings`, held as a module attribute so a test
+#: can replace it without touching the shared ``time`` module.
+_settings_read_sleep = time.sleep
+
+
 def _settings(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    raw = safe_read_file_bytes(str(path))
+    """Read one Kiro ``cli.json`` through the credential gate; absence reads ``{}``.
+
+    Off the event loop a refused read is retried on
+    :data:`_SETTINGS_READ_RETRY_PAUSES`: one immediate re-check, then one pause
+    and a final attempt. Every attempt re-runs the whole gate, so a path that
+    stays refused still raises. On a thread running an event loop exactly one
+    attempt runs, because each attempt is several bounded path resolutions and a
+    pause there stalls every session the gateway serves.
+    """
+
+    def read_once() -> bytes | object | None:
+        if not path.exists():
+            return _ABSENT_SETTINGS
+        return safe_read_file_bytes(str(path))
+
+    raw = read_once()
+    if raw is None and not on_event_loop():
+        for pause in _SETTINGS_READ_RETRY_PAUSES:
+            if pause:
+                _settings_read_sleep(pause)
+            raw = read_once()
+            if raw is not None:
+                break
     if raw is None:
         raise ValueError(f"Cannot read Kiro settings at {path}")
+    if not isinstance(raw, bytes):
+        # The absence sentinel: the file does not exist.
+        return {}
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"Kiro settings must be an object: {path}")
