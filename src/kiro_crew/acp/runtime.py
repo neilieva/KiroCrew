@@ -43,7 +43,7 @@ from kiro_crew.acp._dispatch import reject_option_id as _reject_option_id
 from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import DIRECTION_OUT, record_frame
 from kiro_crew.acp.client import (
     _RESPONSE_WRITE_BOUND_SECS,
     _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
@@ -5370,7 +5370,10 @@ class AcpRuntime:
             self._routed_requests[req_id] = session_id
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
 
         try:
             # Under the write lock so a response frame waiting behind this
@@ -5405,6 +5408,8 @@ class AcpRuntime:
 
         msg = {"jsonrpc": "2.0", "method": method, "params": params}
         data = json.dumps(msg) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
         try:
             # A notification (session/cancel) is fire-and-forget and is the one
@@ -5539,7 +5544,10 @@ class AcpRuntime:
         if projection is not None:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending_requests[req_id] = future
@@ -5594,6 +5602,8 @@ class AcpRuntime:
 
         msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
         data = json.dumps(msg) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
         try:
             await self._write_response_bounded(data.encode(), request_id)
@@ -5610,6 +5620,8 @@ class AcpRuntime:
 
         msg = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
         data = json.dumps(msg) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, msg, len(data), DIRECTION_OUT)
 
         try:
             await self._write_response_bounded(data.encode(), request_id)
@@ -8030,7 +8042,10 @@ class AcpRuntime:
         if projection is not None:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
+        if self.recording_allowed:
+            await record_frame(self._acp_backend, frame, len(data), DIRECTION_OUT)
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()

@@ -37,10 +37,11 @@ from typing import Any, Iterator, NamedTuple
 
 from aiohttp import web
 
-from kiro_crew import __version__, beacon
+from kiro_crew import __version__, beacon, prompt_trace
 from kiro_crew import sel as _sel_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
+from kiro_crew.context_blocks import block_spans
 from kiro_crew.dashboard.chat_utils import slot_transcript_key
 from kiro_crew.dashboard.handlers.usage import (
     SPEND_WINDOW_DAYS,
@@ -1378,6 +1379,58 @@ async def api_context_trace(request: web.Request) -> web.Response:
         return web.json_response({"error": "slot is required", "code": "slot_required"}, status=400)
     trace = await asyncio.to_thread(context_trace, slot, _WINDOW_DAYS)
     return web.json_response(trace)
+
+
+async def api_prompt_trace(request: web.Request) -> web.Response:
+    """GET /api/telemetry/prompt-trace?slot=<session key> — the prompts as sent.
+
+    The developer-mode companion of ``context-trace``: where that endpoint says
+    how many characters each block of a turn had, this one returns the TEXT the
+    newest turns handed the agent transport, each with the ``(start, end,
+    label)`` spans :func:`kiro_crew.context_blocks.block_spans` finds in it — the
+    same scan that produced the sizes, so the two views agree on every boundary.
+    Read from :mod:`kiro_crew.prompt_trace`'s in-memory ring: nothing here is on
+    disk, a gateway restart empties it, and a restricted (incognito / temporary)
+    session never recorded anything to return.
+
+    Dashboard-only, with the same refusal as ``context-trace`` and for a stronger
+    reason: a prompt carries the user's memory, lessons and skill text verbatim,
+    so an app caller is refused outright (deny-by-default, App Kit §5.2) with the
+    indistinguishable ``404`` and a SEL audit line.
+    """
+    request_app = str(request.get("app", "") or "")
+    slot = (request.query.get("slot") or "").strip()
+    if request_app:
+
+        def _audit_denied() -> None:
+            _sel_mod.sel().log_api_access(
+                caller=request_app,
+                operation="prompt_trace",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={slot or '(missing)'}",
+                error="dashboard-only endpoint",
+            )
+
+        await asyncio.to_thread(_audit_denied)
+        return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+    if not slot:
+        return web.json_response({"error": "slot is required", "code": "slot_required"}, status=400)
+
+    def _collect() -> dict[str, Any]:
+        turns: list[dict[str, Any]] = []
+        for rec in prompt_trace.prompts_for(slot):
+            row = rec.to_dict()
+            row["spans"] = [
+                {"start": start, "end": end, "label": label}
+                for start, end, label in block_spans(rec.text)
+            ]
+            turns.append(row)
+        return {"slot": slot, "turns": turns, "max_turns": prompt_trace.MAX_TURNS_PER_SESSION}
+
+    # Off-loop: a session-start prompt is hundreds of kilobytes and the marker
+    # scan over it is not free.
+    return web.json_response(await asyncio.to_thread(_collect))
 
 
 async def api_usage_turns(request: web.Request) -> web.Response:

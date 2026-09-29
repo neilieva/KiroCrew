@@ -91,7 +91,7 @@ from kiro_crew.acp._dispatch import (
     redact_text,
     tool_call_content_text,
 )
-from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp._frame_record import DIRECTION_OUT, record_frame
 from kiro_crew.acp.liveness import (
     EVIDENCE_SAMPLING,
     VERDICT_WORKING,
@@ -11894,7 +11894,10 @@ class AcpClient:
             params = projection.request(method, params)
         req_id = self._next_req_id()
         req = JsonRpcRequest(method=method, params=params, id=req_id)
-        data = json.dumps(req.to_dict()) + "\n"
+        frame = req.to_dict()
+        data = json.dumps(frame) + "\n"
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, frame, len(data), DIRECTION_OUT)
         try:
             # Under the write lock so a response frame waiting behind this
             # (caller-sized, deliberately unbounded) frame measures the
@@ -11957,6 +11960,8 @@ class AcpClient:
 
         msg = {"jsonrpc": "2.0", "id": request_id, "result": result}
         data = json.dumps(msg) + "\n"
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, msg, len(data), DIRECTION_OUT)
         try:
             await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
@@ -11975,6 +11980,8 @@ class AcpClient:
 
         msg = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
         data = json.dumps(msg) + "\n"
+        if self.memory_mode == "persistent":
+            await record_frame(self.backend, msg, len(data), DIRECTION_OUT)
         try:
             await self._write_response_bounded(data.encode(), request_id)
         except (BrokenPipeError, ConnectionResetError) as exc:
@@ -13641,6 +13648,8 @@ class AcpClient:
                 "params": {"sessionId": self._session_id},
             }
             data = json.dumps(notification) + "\n"
+            if self.memory_mode == "persistent":
+                await record_frame(self.backend, notification, len(data), DIRECTION_OUT)
             # Best effort, never swallowed by the write lock: a cancel is the
             # one signal that can end a wedged turn, so it is appended unlocked
             # if the lock does not come within the no-progress bound.

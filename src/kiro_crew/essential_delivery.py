@@ -120,8 +120,15 @@ class EssentialDelivery:
         message: str,
         send: Callable[[str], AsyncIterator[EventT]],
         incarnation: Callable[[], object],
+        on_send: Callable[[str], None] | None = None,
     ) -> AsyncGenerator[EventT, None]:
-        """Deduplicate only trusted, byte-matched builder content on the wire."""
+        """Deduplicate only trusted, byte-matched builder content on the wire.
+
+        ``on_send`` is told the FINAL text — after the receipt substitution
+        below — right before ``send`` is called with it. It is the one place a
+        provider can observe exactly what it hands its transport, which is what
+        :mod:`kiro_crew.prompt_trace` records for the developer view.
+        """
         from kiro_crew.agent_sdk import CONTEXT_EVENT_COMPLETED as EVENT_COMPLETE
         from kiro_crew.agent_sdk import CONTEXT_EVENT_TEXT as EVENT_TEXT_CHUNK
         from kiro_crew.agent_sdk import CONTEXT_EVENT_TOOL as EVENT_TOOL_CALL
@@ -144,6 +151,8 @@ class EssentialDelivery:
             message = message.replace(candidate.envelope, replacement, 1)
         productive = False
         completed = False
+        if on_send is not None:
+            on_send(message)
         try:
             async with _closing_events(send(message)) as events:
                 async for event in events:

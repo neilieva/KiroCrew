@@ -12,7 +12,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncContextManager
 
-from kiro_crew import model_scope
+from kiro_crew import model_scope, prompt_trace
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -2276,6 +2276,16 @@ class AcpProvider(LLMProvider):
         # the fallback keeps those guides reachable without a false capability.
         return self._client.backend == ACP_BACKEND_KAS
 
+    def _trace_outbound_prompt(self, text: str) -> None:
+        """Keep the exact prompt text for the developer view (persistent sessions only).
+
+        Same gate as the wire recorder: an incognito or temporary session leaves
+        no prompt text behind, in memory or anywhere else.
+        """
+        if self.memory_mode != "persistent":
+            return
+        prompt_trace.record(self._owning_session_key(), text, backend=self._client.backend)
+
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         # The direct client can respawn in ensure_ready; resolve that BEFORE
         # comparing receipts so a recycled conversation receives the full text.
@@ -2283,7 +2293,10 @@ class AcpProvider(LLMProvider):
             await self._client.ensure_ready()
         async with aclosing(
             self.essential_delivery.stream(
-                message, self._client.stream_events, lambda: self.context_incarnation
+                message,
+                self._client.stream_events,
+                lambda: self.context_incarnation,
+                on_send=self._trace_outbound_prompt,
             )
         ) as events:
             async for e in events:

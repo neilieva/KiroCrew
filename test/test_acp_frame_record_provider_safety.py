@@ -218,6 +218,63 @@ def _fresh_recorder(monkeypatch):
     _frame_record._reset_for_tests()
 
 
+# ── 0. OUTBOUND: what the transports write is recorded beside what they read ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", PROVIDERS, ids=lambda b: b or "kiro-cli")
+async def test_runtime_records_the_frames_it_writes(monkeypatch, tmp_path, backend):
+    """``send_request`` is the path every ``session/prompt`` takes."""
+    monkeypatch.setenv(_frame_record.ENV_RECORD_FRAMES, str(tmp_path))
+    _frame_record.start_recorder()
+    async with _LiveRuntime(backend) as live:
+        await live.rt.send_request(
+            "session/prompt",
+            {"sessionId": live.session_id, "prompt": [{"type": "text", "text": "hi"}]},
+        )
+        await live.rt.send_notification("session/cancel", {"sessionId": live.session_id})
+        await _frame_record.flush_for_tests()
+    out = tmp_path / f"{_frame_record.fixture_dir_name(backend)}.out.jsonl"
+    methods = [json.loads(ln)["method"] for ln in out.read_text(encoding="utf-8").splitlines()]
+    assert methods == ["session/prompt", "session/cancel"]
+    assert live.rt._process.stdin.write.call_count == 2, "recording must not replace the write"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["incognito", "temporary"])
+async def test_restricted_runtime_never_records_what_it_writes(monkeypatch, tmp_path, mode):
+    monkeypatch.setenv(_frame_record.ENV_RECORD_FRAMES, str(tmp_path))
+    _frame_record.start_recorder()
+    async with _LiveRuntime("kas") as live:
+        live.rt.recording_allowed = False  # what create_session(memory_mode=mode) sets
+        await live.rt.send_request("session/prompt", {"sessionId": live.session_id, "prompt": []})
+        await _frame_record.flush_for_tests()
+    assert not list(tmp_path.iterdir()), f"{mode}: an outbound frame was recorded"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", PROVIDERS, ids=lambda b: b or "kiro-cli")
+async def test_client_records_the_requests_it_writes(monkeypatch, tmp_path, backend):
+    monkeypatch.setenv(_frame_record.ENV_RECORD_FRAMES, str(tmp_path))
+    _frame_record.start_recorder()
+    client = AcpClient(acp_backend=backend)
+    process = MagicMock()
+    process.stdin = MagicMock()
+    process.stdin.write = MagicMock()
+    process.stdin.drain = AsyncMock()
+    process.returncode = None
+    client._process = process
+    await client._send_request("session/prompt", {"sessionId": "s-1", "prompt": []})
+    client.memory_mode = "incognito"
+    await client._send_request("session/prompt", {"sessionId": "s-1", "prompt": []})
+    await _frame_record.flush_for_tests()
+    out = tmp_path / f"{_frame_record.fixture_dir_name(backend)}.out.jsonl"
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, "the incognito request must not be recorded"
+    assert json.loads(lines[0])["method"] == "session/prompt"
+    assert process.stdin.write.call_count == 2
+
+
 # ── 1. OFF: the default state of every real deployment ──────────────────────
 
 

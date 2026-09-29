@@ -7,6 +7,7 @@ import ErrorNotice from '../components/ErrorNotice'
 import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import type { SubagentActivity } from '../types'
+import { PromptAsSentSection, promptForTurn, type PromptTrace } from './PromptAsSentSection'
 import { SessionBreakdownTree } from './SessionBreakdownTree'
 import { CATEGORY_FILL } from './contextSourceColors'
 
@@ -136,7 +137,7 @@ function humanise(label: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1)
 }
 
-function displayName(label: string): string {
+export function displayName(label: string): string {
   const key = BLOCK_KEY[label]
   return key ? i18nT(key) : humanise(label)
 }
@@ -186,6 +187,8 @@ interface ChartTurn {
   total: number
   cats: Record<Category, number>
   isStart: boolean
+  /** The turn's exact prompt text is still held (see PromptAsSentSection). */
+  hasPrompt: boolean
 }
 
 /**
@@ -391,6 +394,13 @@ function StackedArea({
             </text>
           ) : null,
         )}
+        {/* A dot under each turn whose prompt text is still held, so the reader
+            can see which columns the "Prompt as sent" section can open. */}
+        {turns.map((t, i) =>
+          t.hasPrompt ? (
+            <circle key={`p${t.n}`} cx={xAt(i)} cy={plotBottom + 9} r={2.5} fill="var(--accent)" data-prompt-dot={t.n} />
+          ) : null,
+        )}
       </svg>
       {/* Transparent hit columns: one real button per turn so selection is
           clickable, focusable and arrow-key navigable. */}
@@ -415,7 +425,10 @@ function StackedArea({
             type="button"
             tabIndex={i === focusIdx ? 0 : -1}
             aria-pressed={i === selectedIdx}
-            aria-label={i18nT('pages.contextBreakdown.turn_button', { n: fmtN(t.n), chars: fmtN(t.total) })}
+            aria-label={i18nT(
+              t.hasPrompt ? 'pages.contextBreakdown.turn_button_prompt' : 'pages.contextBreakdown.turn_button',
+              { n: fmtN(t.n), chars: fmtN(t.total) },
+            )}
             data-turn={t.n}
             className={`absolute inset-y-0 appearance-none bg-transparent border-0 p-0 m-0 cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${
               pointerSurface ? 'pointer-events-none' : 'hover:bg-[var(--card-hl)]'
@@ -444,7 +457,16 @@ function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected:
       }`}
       onClick={() => onSelect(turn.n)}
     >
-      <span>{i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.n) })}</span>
+      <span className="flex items-center gap-2">
+        {i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.n) })}
+        {turn.hasPrompt ? (
+          <i
+            className="w-[5px] h-[5px] rounded-full bg-[var(--accent)] shrink-0"
+            aria-hidden="true"
+            data-prompt-dot={turn.n}
+          />
+        ) : null}
+      </span>
       <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">
         {i18nT('pages.contextBreakdown.turn_button_chars', { chars: fmtN(turn.total) })}
       </span>
@@ -493,10 +515,13 @@ function CategoryRow({ cat, chars, blocks }: { cat: Category; chars: number; blo
  *  fabricated trace. */
 export function ContextBreakdownPanel({
   trace,
+  prompts,
   isLoading,
   chartWidth,
 }: {
   trace: ContextTrace | null | undefined
+  /** The session's recorded prompt texts; the section is omitted when absent. */
+  prompts?: PromptTrace | null
   isLoading?: boolean
   /** Fixed chart width in px (capture harnesses and tests); measured when absent. */
   chartWidth?: number
@@ -515,13 +540,21 @@ export function ContextBreakdownPanel({
       </div>
     )
   } else {
-    body = <ContextBreakdownCard trace={trace} chartWidth={chartWidth} />
+    body = <ContextBreakdownCard trace={trace} prompts={prompts} chartWidth={chartWidth} />
   }
 
   return <div>{body}</div>
 }
 
-function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; chartWidth?: number }) {
+function ContextBreakdownCard({
+  trace,
+  prompts,
+  chartWidth,
+}: {
+  trace: ContextTrace
+  prompts?: PromptTrace | null
+  chartWidth?: number
+}) {
   // `null` follows the newest turn as the trace grows; a number pins a turn the
   // user chose, so a new row arriving does not yank the detail view away.
   const [pinned, setPinned] = useState<number | null>(null)
@@ -531,6 +564,9 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
     total: turn.total_chars,
     cats: categorise(turn.blocks),
     isStart: turn.phase === 'session_start',
+    hasPrompt: prompts
+      ? promptForTurn(prompts.turns, turn.ts, i > 0 ? trace.turns[i - 1].ts : undefined) !== null
+      : false,
   }))
   // Session-start turns are listed above the chart: one of them is many times
   // the size of any later turn and would pin the y-axis, flattening the rest.
@@ -545,6 +581,12 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
   const selectedChart = all[selected - 1]
   const previous = selected > 1 ? all[selected - 2].total : undefined
   const delta = deltaText(selectedChart.total, previous)
+  // The developer view of the selected turn's exact text. Undefined `prompts`
+  // means the caller did not fetch it (tests, captures), and the section stays
+  // out; `null`/empty means fetched and nothing recorded, which the section says.
+  const promptRecord = prompts
+    ? promptForTurn(prompts.turns, selectedTurn.ts, selected > 1 ? trace.turns[selected - 2].ts : undefined)
+    : null
   const select = (n: number) => setPinned(n === newest ? null : n)
 
   const rows = CATEGORIES.map(cat => ({
@@ -592,6 +634,12 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
                   {i18nT(CATEGORY_KEY[cat])}
                 </span>
               ))}
+              {shown.some(t => t.hasPrompt) || starts.some(t => t.hasPrompt) ? (
+                <span className="flex items-center gap-1.5" data-testid="prompt-kept-legend">
+                  <i className="w-[5px] h-[5px] rounded-full bg-[var(--accent)] shrink-0" aria-hidden="true" />
+                  {i18nT('pages.contextBreakdown.prompt_kept_legend')}
+                </span>
+              ) : null}
             </div>
             <p className="m-0 mt-2 text-[12px] text-muted">{i18nT('pages.contextBreakdown.pick_hint')}</p>
             <p className="m-0 mt-2 text-[12px] text-muted">
@@ -622,6 +670,10 @@ function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; char
         ))}
       </div>
 
+      {prompts !== undefined ? (
+        <PromptAsSentSection record={promptRecord} categoryOf={categoryOf} displayName={displayName} />
+      ) : null}
+
       <p className="m-0 mx-4 mt-4 mb-4 pt-3 border-t border-border text-[12px] text-muted">
         {i18nT('pages.contextBreakdown.footer')}
       </p>
@@ -645,6 +697,15 @@ export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagen
     // The trace grows by one row per turn, so a tab left open goes stale.
     refetchInterval: 15_000,
   })
+  // The exact prompt texts behind the newest turns. Same cadence as the trace so
+  // a turn's row and its text arrive together; a read failure here only loses
+  // the developer section, so it is not surfaced as an error of its own.
+  const { data: prompts } = useQuery<PromptTrace>({
+    queryKey: ['prompt-trace', slot],
+    queryFn: () => api.telemetryPromptTrace(slot),
+    enabled: !!slot,
+    refetchInterval: 15_000,
+  })
 
   return (
     <div className="h-full overflow-auto p-3">
@@ -652,7 +713,7 @@ export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagen
       {/* A failed trace read otherwise rendered as an empty panel. Read-only
           side tab, so the hand-off loses nothing; the poll above retries. */}
       <ErrorNotice message={error ? (error instanceof Error ? error.message : String(error)) : null} askAgent className="mb-3" />
-      <ContextBreakdownPanel trace={data} isLoading={isLoading} />
+      <ContextBreakdownPanel trace={data} prompts={prompts} isLoading={isLoading} />
     </div>
   )
 }

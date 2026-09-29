@@ -22,6 +22,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
+from kiro_crew import prompt_trace
 from kiro_crew.acp.client import (
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -556,6 +557,16 @@ class AcpSessionProvider(LLMProvider):
 
         return self.backend == ACP_BACKEND_KAS
 
+    def _trace_outbound_prompt(self, text: str) -> None:
+        """Keep the exact prompt text for the developer view (persistent sessions only).
+
+        Same gate as the wire recorder: an incognito or temporary session leaves
+        no prompt text behind, in memory or anywhere else.
+        """
+        if self.memory_mode != "persistent":
+            return
+        prompt_trace.record(self._session_key, text, backend=self.backend)
+
     async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
         """Send a prompt and yield LLMEvent objects until the turn completes."""
         # Re-establish this session's gateway claim before the turn can call a
@@ -581,7 +592,10 @@ class AcpSessionProvider(LLMProvider):
         try:
             async with aclosing(
                 self.essential_delivery.stream(
-                    message, self._handle.prompt, lambda: self.context_incarnation
+                    message,
+                    self._handle.prompt,
+                    lambda: self.context_incarnation,
+                    on_send=self._trace_outbound_prompt,
                 )
             ) as events:
                 async for event in events:

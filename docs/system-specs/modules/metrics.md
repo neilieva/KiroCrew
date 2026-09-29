@@ -1093,6 +1093,35 @@ indistinguishable `404` (`code: not_found`) and the refusal is SEL-audited
 (deny-by-default, App Kit §5.2) — an app that needs its own turns' billing has
 `/api/usage/turns`.
 
+**Prompt as sent (`prompt-trace`).** The size breakdown answers "how much"; the
+Developer-Mode companion under the selected turn's detail answers "what": the
+exact text the turn handed the agent transport, one disclosure row per block
+with the raw slice behind it, a segment bar in reading order, and a Copy-all
+button. The text comes from `kiro_crew.prompt_trace`, a process-memory ring of
+the newest `MAX_TURNS_PER_SESSION` (12) prompts per session under a global
+`MAX_TOTAL_CHARS` budget (least recently written session evicted whole, never
+the one just written), fed by both providers' `stream()` through
+`EssentialDelivery.stream(on_send=...)` — so what is recorded is the string
+AFTER the receipt substitution, i.e. what `build_prompt_blocks` wraps into the
+`session/prompt` text block. It is never written to disk (a gateway restart
+empties it; the opt-in wire recorder in `acp/_frame_record.py` is the durable
+capture) and a restricted (incognito / temporary) session records nothing, the
+same gate the wire recorder applies. `handlers/telemetry.py::api_prompt_trace`
+serves it as `GET /api/telemetry/prompt-trace?slot=<session key>`
+(`400` without a slot; dashboard-only with the same indistinguishable `404` +
+SEL audit for an app caller as `context-trace`, and for a stronger reason: the
+payload carries memory, lessons and skill text verbatim). Each turn carries its
+`spans` — `(start, end, label)` from `context_blocks.block_spans`, the scan
+`split_blocks` now sums, so the developer view and the size breakdown cannot
+disagree about a boundary. The panel matches a prompt to a trace turn by time
+(`promptForTurn`: the newest record stamped at or before the turn's usage row
+and after the previous turn's row, so a failed turn is skipped rather than
+credited to its successor), draws an accent dot under every chart column (and
+beside a session-start row) whose text is still held, adds a "Prompt text kept"
+legend entry when any is, and says plainly when the selected turn has none. The
+section is rendered only once the prompt trace has loaded (`prompts` undefined
+omits it), so a loading tab never flashes the empty state.
+
 **Row-timestamp parsing has one owner.** `usage._parse_row_dt` is the single
 spelling for reading a stored row timestamp (`Z` rewritten to `+00:00` for
 py3.10's `fromisoformat`; a naive stamp left naive so a caller's
