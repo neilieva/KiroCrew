@@ -1780,12 +1780,14 @@ class TestFileLockContention:
             os.close(fd_holder)
             os.close(fd_contender)
 
-    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows on-loop single-shot acquire")
-    def test_windows_contended_lock_on_event_loop_fails_fast(self, tmp_path):
-        # On the asyncio event-loop thread a contended lock must NOT spin-sleep
-        # (that freezes chat/heartbeat): _win_acquire_blocking is single-shot
-        # there, so file_lock fails closed immediately instead of waiting out
-        # the timeout. Assert both the fast-fail AND that it took ~no time.
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows on-loop bounded acquire")
+    def test_windows_contended_lock_on_event_loop_fails_at_the_on_loop_cap(
+        self, tmp_path, monkeypatch
+    ):
+        # On the asyncio event-loop thread a contended lock must not spin for
+        # the 300s default (that freezes chat/heartbeat): the wait there is
+        # capped at _LOCK_ON_LOOP_MAX_SECS, and file_lock then fails closed.
+        monkeypatch.setattr(pc, "_LOCK_ON_LOOP_MAX_SECS", 0.3)
         import asyncio
 
         lock = tmp_path / ".onloop.lock"
@@ -1802,8 +1804,8 @@ class TestFileLockContention:
                     pass
             elapsed = time.monotonic() - start
             pc.release_lock(fd_holder)
-            # Single-shot: nowhere near the multi-second timeout ceiling.
-            assert elapsed < 1.0, f"on-loop acquire spun for {elapsed:.2f}s"
+            # Capped: nowhere near the multi-second timeout ceiling.
+            assert elapsed < 1.5, f"on-loop acquire spun for {elapsed:.2f}s"
 
         try:
             asyncio.run(_contend_on_loop())

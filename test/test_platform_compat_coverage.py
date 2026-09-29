@@ -365,19 +365,34 @@ class TestWindowsLocking:
             assert pc._win_acquire_blocking(handle.fileno(), timeout=1.0) is False
 
     @pytest.mark.asyncio
-    async def test_acquire_is_single_shot_on_the_event_loop(self, monkeypatch, tmp_path):
-        # A spin-sleep on the loop thread would freeze chat/heartbeat, so the
-        # on-loop acquire must try exactly once and fail closed.
-        fake = _FakeMsvcrt([False])
+    async def test_on_loop_acquire_waits_out_a_brief_holder(self, monkeypatch, tmp_path):
+        # A single attempt refuses a brief overlap with another handle in this
+        # process, so the on-loop acquire polls -- and succeeds once it clears.
+        fake = _FakeMsvcrt([False, False, True])
         _fake_windows(monkeypatch)
         monkeypatch.setattr(pc, "msvcrt", fake, raising=False)
-        slept = _fake_clock(monkeypatch, [0.0])
+        slept = _fake_clock(monkeypatch, [0.0, 0.01, 0.02])
         lock = tmp_path / "d.lock"
         lock.write_text("")
         with open(lock, "r+") as handle:
+            assert pc._win_acquire_blocking(handle.fileno()) is True
+        assert slept == [pc._WIN_LOCK_POLL_SECS, pc._WIN_LOCK_POLL_SECS]
+
+    @pytest.mark.asyncio
+    async def test_on_loop_acquire_is_capped_below_the_default(self, monkeypatch, tmp_path):
+        # The 300s default would freeze every session on the loop, so the
+        # on-loop spin stops at _LOCK_ON_LOOP_MAX_SECS instead.
+        fake = _FakeMsvcrt([False] * 5)
+        _fake_windows(monkeypatch)
+        monkeypatch.setattr(pc, "msvcrt", fake, raising=False)
+        cap = pc._LOCK_ON_LOOP_MAX_SECS
+        slept = _fake_clock(monkeypatch, [0.0, 0.5, cap + 0.1])
+        lock = tmp_path / "d2.lock"
+        lock.write_text("")
+        with open(lock, "r+") as handle:
             assert pc._win_acquire_blocking(handle.fileno()) is False
-        assert slept == []
-        assert fake.calls == [_FakeMsvcrt.LK_NBLCK]
+        assert len(slept) == 1
+        assert len(fake.calls) == 2
 
     def test_file_lock_round_trips_and_unlocks(self, monkeypatch, tmp_path):
         fake = _FakeMsvcrt([True])
@@ -436,7 +451,7 @@ class TestWindowsLocking:
         lock = tmp_path / "timeout.lock"
         lock.write_text("")
         with open(lock, "r+") as handle:
-            with pytest.raises(OSError, match=r"within 2\.5s"):
+            with pytest.raises(OSError, match=r"limit 2\.5s"):
                 with pc.file_lock(handle.fileno(), timeout=2.5):
                     pytest.fail("body must not run without the lock")
 

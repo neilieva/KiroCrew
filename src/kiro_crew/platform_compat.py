@@ -820,8 +820,13 @@ else:
 #    cover a legitimately long holder that can hold the lock across a
 #    multi-second operation, and a waiter there must NOT give up and race it. So
 #    use a generous ceiling that no real hold approaches.
-#  - ON the loop (e.g. bridges._mcp_lock during app enable): a spin-sleep would
-#    freeze chat/heartbeat, so that path never sleeps at all (single-shot).
+#  - ON the loop (e.g. the workspace cli.json overlay written from async
+#    ``start()``, or the skill-projection alias lock): a long spin-sleep would
+#    freeze chat/heartbeat, but a single attempt refuses a brief overlap that a
+#    few milliseconds of waiting would clear. ``flock`` treats a second
+#    descriptor in the SAME process as a competing holder, so a sibling thread's
+#    sub-second critical section is enough to refuse a single-shot caller. So
+#    the on-loop wait polls too, capped at ``_LOCK_ON_LOOP_MAX_SECS``.
 _LOCK_POLL_SECS = 0.01
 # Backoff cap for the POSIX poll. A kernel-blocking acquire sleeps at zero cost,
 # so a flat 10ms poll would add ~30k pointless wakeups across the full ceiling;
@@ -831,6 +836,12 @@ _LOCK_POLL_MAX_SECS = 0.25
 # Generous off-loop ceiling: longer than any legitimate hold, short enough that
 # a truly stuck/permission-denied fd still fails.
 _LOCK_TIMEOUT_SECS = 300.0
+# Cap on how long an acquire on the asyncio event-loop thread may poll. It is the
+# ceiling of the on-loop callers that exist (cli.json overlay, skill-projection
+# alias lock, both 2s), and short enough that a genuinely held lock costs the
+# loop one bounded stall rather than the 300s off-loop ceiling. A caller's own
+# shorter timeout still wins.
+_LOCK_ON_LOOP_MAX_SECS = 2.0
 
 # The ceiling is not Windows-only. ``fcntl.flock`` has no timeout argument, so an
 # unbounded POSIX acquire waits on a stuck holder without limit -- and on the boot
@@ -841,17 +852,41 @@ _WIN_LOCK_POLL_SECS = _LOCK_POLL_SECS
 _WIN_LOCK_TIMEOUT_SECS = _LOCK_TIMEOUT_SECS
 
 
-def _lock_timeout_message(timeout: float, *, exclusive: bool = True) -> str:
+def _on_event_loop() -> bool:
+    """True when called on a thread that is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _acquire_ceiling(timeout: float | None, *, on_loop: bool) -> float:
+    """The poll ceiling an acquire uses: the caller's, capped on the loop thread."""
+    ceiling = _LOCK_TIMEOUT_SECS if timeout is None else timeout
+    if on_loop:
+        return min(ceiling, _LOCK_ON_LOOP_MAX_SECS)
+    return ceiling
+
+
+def _lock_timeout_message(
+    waited: float, *, exclusive: bool = True, ceiling: float | None = None
+) -> str:
     """The one refusal string both platforms raise when the ceiling is hit.
 
-    Names the ceiling and the reason. A caller that catches this as best-effort
-    work has nothing else to report, so this message is the only evidence of WHY
-    the critical section was declined.
+    Names how long the acquire REALLY waited, the ceiling it was held to, and
+    what was observed: the lock was still held. It deliberately does not say
+    why. The acquire cannot tell a hung holder from a busy one or from a queue
+    of waiters, and naming one of them sends an operator after the wrong fix.
+    A caller that catches this as best-effort work has nothing else to report,
+    so this message is the only evidence of WHY the critical section was
+    declined.
     """
     kind = "exclusive" if exclusive else "shared"
+    limit = waited if ceiling is None else ceiling
     return (
-        f"could not acquire {kind} file lock within {timeout:g}s "
-        "(a holder is stuck); refusing to proceed unserialized"
+        f"could not acquire {kind} file lock: still held after waiting "
+        f"{waited:.2f}s (limit {limit:g}s); refusing to proceed unserialized"
     )
 
 
@@ -873,13 +908,14 @@ def _posix_acquire_blocking(
     another holder has it; any other errno is about this fd and propagates at
     once, so a real defect is not reported as a stuck holder at the ceiling.
 
-    NEVER polls on the asyncio event-loop thread, matching
-    :func:`_win_acquire_blocking`: ``time.sleep`` there would freeze chat and
-    heartbeat for the whole wait, and a freeze long enough to miss a heartbeat is
-    a supervisor kill. On the loop the acquire is single-shot -- take it if free,
-    else refuse at once -- so a caller fails closed instead of stalling every
-    other session. Off the loop, which is where the lock is normally taken, it
-    polls to the ceiling as a real wait.
+    On the asyncio event-loop thread the poll is capped at
+    ``_LOCK_ON_LOOP_MAX_SECS`` (or the caller's shorter *timeout*), matching
+    :func:`_win_acquire_blocking`. A long ``time.sleep`` there would freeze chat
+    and heartbeat, but a single attempt refuses a brief overlap: ``flock`` sees a
+    second descriptor in this same process as a competing holder, so a sibling
+    thread's millisecond critical section would refuse a single-shot caller.
+    Off the loop, which is where the lock is normally taken, it polls to the
+    full ceiling as a real wait.
 
     The sleep BACKS OFF from ``_LOCK_POLL_SECS`` to ``_LOCK_POLL_MAX_SECS``: a
     flat 10ms poll would wake ~30k times across the full ceiling for no benefit,
@@ -900,16 +936,7 @@ def _posix_acquire_blocking(
                 raise
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
-        # Single attempt only -- a poll-sleep here blocks the event loop.
-        return _try_once()
-
-    ceiling = _LOCK_TIMEOUT_SECS if timeout is None else timeout
+    ceiling = _acquire_ceiling(timeout, on_loop=_on_event_loop())
     deadline = time.monotonic() + ceiling
     delay = _LOCK_POLL_SECS
     while True:
@@ -929,11 +956,10 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _LOCK_TIMEOUT_SECS) -> bo
 
     Returns True if the lock was taken, False if it could not be.
 
-    NEVER spins on the asyncio event-loop thread: ``time.sleep`` there would
-    freeze chat/heartbeat for the whole wait. A few callers still take the lock
-    on the loop (e.g. bridges._mcp_lock during app enable), so when a running
-    loop is detected the acquire is single-shot — take it if free, else return
-    False at once — and the caller fails closed rather than stalling the loop.
+    On the asyncio event-loop thread the spin is capped at
+    ``_LOCK_ON_LOOP_MAX_SECS`` (or a shorter ``timeout``): a long sleep there
+    would freeze chat/heartbeat, while a single attempt refuses a brief overlap
+    with another handle in this same process that a few polls would clear.
     Off the loop (the common case) it polls up to ``timeout`` as a real
     blocking wait, so a legitimately long holder is waited out rather than
     raced.
@@ -947,22 +973,14 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _LOCK_TIMEOUT_SECS) -> bo
         except OSError:
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
-        # Single attempt only — a spin-sleep here blocks the event loop.
-        return _try_once()
-
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + _acquire_ceiling(timeout, on_loop=_on_event_loop())
     while True:
         if _try_once():
             return True
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return False
-        time.sleep(_LOCK_POLL_SECS)
+        time.sleep(min(_LOCK_POLL_SECS, remaining))
 
 
 @contextlib.contextmanager
@@ -991,12 +1009,13 @@ def file_lock(
     On BOTH platforms, if the lock cannot be taken within the ceiling
     ``file_lock`` FAILS CLOSED — it raises rather than entering the critical
     section unserialized, since proceeding lock-less is the exact fail-open that
-    loses writes. On BOTH platforms the acquire is additionally single-shot when
-    called on the asyncio event-loop thread: a poll-sleep there would freeze chat
-    and heartbeat for the whole wait, and a freeze long enough to miss a heartbeat
-    is a supervisor kill, so a contended on-loop caller is refused at once and
-    fails closed rather than stalling every other session. The timeout is a safety
-    ceiling against a stuck holder, not a normal wait. ``required`` is kept for
+    loses writes. On BOTH platforms an acquire on the asyncio event-loop thread
+    polls for at most ``_LOCK_ON_LOOP_MAX_SECS`` (or the caller's shorter
+    *timeout*): a long poll-sleep there would freeze chat and heartbeat, but a
+    single attempt would refuse a brief overlap with another descriptor in this
+    same process, which ``flock`` counts as a competing holder. The refusal names
+    the time really waited and only what was observed (the lock was still held).
+    The timeout is a safety ceiling, not a normal wait. ``required`` is kept for
     call-site intent and does not change the outcome (both paths refuse to proceed
     without the lock).
 
@@ -1032,19 +1051,21 @@ def file_lock(
             # BlockingIOError (an OSError) when held: same fail-closed contract
             # as the Windows branch, reported by the platform rather than by us.
             fcntl.flock(fd, mode | fcntl.LOCK_NB)
-        elif not _posix_acquire_blocking(fd, mode, timeout=timeout):
-            # Past the ceiling the holder is stuck, not busy. Refuse LOUDLY
-            # rather than wait on it without limit: an unbounded wait here leaves
-            # a boot with no port bound and no log line, while a raise is
-            # something the caller can report and recover from -- the gateway
-            # boot path logs it at ERROR, prints the repair command, and still
-            # binds its port.
-            raise OSError(
-                _lock_timeout_message(
-                    _LOCK_TIMEOUT_SECS if timeout is None else timeout,
-                    exclusive=exclusive,
+        else:
+            started = time.monotonic()
+            if not _posix_acquire_blocking(fd, mode, timeout=timeout):
+                # Refuse LOUDLY rather than wait without limit: an unbounded wait
+                # here leaves a boot with no port bound and no log line, while a
+                # raise is something the caller can report and recover from --
+                # the gateway boot path logs it at ERROR, prints the repair
+                # command, and still binds its port.
+                raise OSError(
+                    _lock_timeout_message(
+                        time.monotonic() - started,
+                        exclusive=exclusive,
+                        ceiling=_acquire_ceiling(timeout, on_loop=_on_event_loop()),
+                    )
                 )
-            )
         try:
             yield
         finally:
@@ -1062,6 +1083,7 @@ def file_lock(
         # change the outcome — both paths refuse to proceed lock-less.
         # The waiting path with no explicit ceiling is called with no keyword, so
         # the default-argument call shape existing tests stub out is preserved.
+        started = time.monotonic()
         if not wait:
             ceiling = 0.0
             acquired = _win_acquire_blocking(fd, timeout=0.0)
@@ -1074,9 +1096,15 @@ def file_lock(
         if not acquired:
             if not wait:
                 # Held right now. BlockingIOError so the caller can tell this
-                # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
+                # from the timed-out wait below, matching POSIX LOCK_NB.
                 raise BlockingIOError("file lock is held; not waiting for it")
-            raise OSError(_lock_timeout_message(ceiling, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=_acquire_ceiling(ceiling, on_loop=_on_event_loop()),
+                )
+            )
         try:
             yield
         finally:
@@ -1122,7 +1150,7 @@ def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     pattern (where a context manager does not fit).
 
     POSIX and Windows both wait up to ``_LOCK_TIMEOUT_SECS`` off the asyncio loop
-    thread and are both single-shot on it: POSIX polls ``fcntl.flock`` with
+    thread and up to ``_LOCK_ON_LOOP_MAX_SECS`` on it: POSIX polls ``fcntl.flock`` with
     ``LOCK_NB`` (:func:`_posix_acquire_blocking`), Windows polls ``msvcrt.locking``
     (:func:`_win_acquire_blocking`). If the lock cannot be taken it FAILS
     CLOSED — raises rather than letting the caller proceed unserialized — since
@@ -1130,13 +1158,25 @@ def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     proceeding lock-less is the fail-open that loses writes. Pair every call
     with :func:`release_lock` on the same ``fd``.
     """
+    started = time.monotonic()
     if IS_POSIX:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if not _posix_acquire_blocking(fd, mode):
-            raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=_acquire_ceiling(None, on_loop=_on_event_loop()),
+                )
+            )
         return
     if not _win_acquire_blocking(fd):
-        raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS))
+        raise OSError(
+            _lock_timeout_message(
+                time.monotonic() - started,
+                ceiling=_acquire_ceiling(None, on_loop=_on_event_loop()),
+            )
+        )
 
 
 def release_lock(fd: int) -> None:

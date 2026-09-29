@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -125,8 +126,9 @@ class TestFileLockCeiling:
 
         message = str(excinfo.value)
         assert "could not acquire" in message
-        assert f"{_TEST_CEILING:g}s" in message
-        assert "stuck" in message
+        assert f"limit {_TEST_CEILING:g}s" in message
+        assert "still held after waiting" in message
+        assert "stuck" not in message
         assert "unserialized" in message
 
     def test_uncontended_acquire_still_succeeds(self, tmp_path: Path):
@@ -225,8 +227,8 @@ class TestCallerSuppliedCeiling:
             os.close(fd)
 
         message = str(excinfo.value)
-        assert f"{caller_ceiling:g}s" in message
-        assert f"{_TEST_CEILING:g}s" not in message
+        assert f"limit {caller_ceiling:g}s" in message
+        assert f"limit {_TEST_CEILING:g}s" not in message
 
     def test_omitting_the_ceiling_still_uses_the_module_default(self, held_lock: Path):
         # The parameter is additive: a caller that passes nothing is bounded by
@@ -243,7 +245,7 @@ class TestCallerSuppliedCeiling:
 
         assert waited >= _TEST_CEILING
         assert waited < _TEST_CEILING + 30
-        assert f"{_TEST_CEILING:g}s" in str(excinfo.value)
+        assert f"limit {_TEST_CEILING:g}s" in str(excinfo.value)
 
 
 class TestStagingLockOutlastsItsOwnWork:
@@ -282,36 +284,122 @@ class TestStagingLockOutlastsItsOwnWork:
         assert seen.get("timeout") == frontend._STAGING_LOCK_TIMEOUT
 
 
-class TestOnLoopNeverSleeps:
-    """A contended acquire on the event-loop thread must not sleep there."""
+class TestOnLoopBoundedWait:
+    """An acquire on the event-loop thread waits briefly, then refuses."""
 
-    def test_a_contended_on_loop_acquire_refuses_at_once(self, held_lock: Path):
-        # A poll-sleep on the loop freezes chat and heartbeat for the whole wait,
-        # and a freeze long enough to miss a heartbeat is a supervisor kill. So a
-        # contended on-loop acquire fails closed instead of waiting.
-        slept: list[float] = []
+    @staticmethod
+    def _hold_in_thread(lock_path: Path, release_after: float | None):
+        """Hold *lock_path* from a sibling thread on its own descriptor.
+
+        ``flock`` counts a second descriptor in the SAME process as a competing
+        holder, which is the overlap a single-shot on-loop acquire refused.
+        Returns ``(thread, stop)``; setting ``stop`` releases a holder that was
+        told never to release on its own.
+        """
+        held = threading.Event()
+        stop = threading.Event()
+
+        def _run() -> None:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                with platform_compat.file_lock(fd, exclusive=True):
+                    held.set()
+                    stop.wait(release_after)
+            finally:
+                os.close(fd)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        assert held.wait(5), "holder thread failed to take the lock"
+        return thread, stop
+
+    def test_a_brief_in_process_holder_is_waited_out(self, tmp_path: Path):
+        lock_path = tmp_path / "overlap.lock"
+        thread, stop = self._hold_in_thread(lock_path, release_after=0.05)
+        outcome: dict[str, float] = {}
 
         async def _acquire_on_loop() -> None:
-            with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(time, "sleep", lambda s: slept.append(s))
-                fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                started = time.monotonic()
+                with platform_compat.file_lock(fd, exclusive=True, timeout=2.0):
+                    outcome["waited"] = time.monotonic() - started
+            finally:
+                os.close(fd)
+
+        try:
+            asyncio.run(_acquire_on_loop())
+        finally:
+            stop.set()
+            thread.join(5)
+
+        # Entered after the holder let go, not refused at 0s and not at the 2s cap.
+        assert "waited" in outcome
+        assert outcome["waited"] >= 0.03
+        assert outcome["waited"] < 1.0
+
+    def test_a_holder_that_never_releases_is_refused_at_the_timeout(self, tmp_path: Path):
+        lock_path = tmp_path / "held-forever.lock"
+        thread, stop = self._hold_in_thread(lock_path, release_after=None)
+        result: dict[str, object] = {}
+
+        async def _acquire_on_loop() -> None:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                started = time.monotonic()
                 try:
-                    started = time.monotonic()
-                    with pytest.raises(OSError):
-                        with platform_compat.file_lock(fd, exclusive=True, wait=True):
-                            pytest.fail("entered the critical section while held")
-                    # Refused promptly, not at the ceiling.
-                    assert time.monotonic() - started < _TEST_CEILING
-                finally:
-                    os.close(fd)
+                    with platform_compat.file_lock(fd, exclusive=True, timeout=2.0):
+                        result["entered"] = True
+                except OSError as exc:
+                    result["error"] = exc
+                result["waited"] = time.monotonic() - started
+            finally:
+                os.close(fd)
+
+        try:
+            asyncio.run(_acquire_on_loop())
+        finally:
+            stop.set()
+            thread.join(5)
+
+        assert "entered" not in result
+        error = result["error"]
+        assert isinstance(error, OSError) and not isinstance(error, BlockingIOError)
+        waited = result["waited"]
+        assert isinstance(waited, float)
+        assert 2.0 <= waited < 3.0
+        message = str(error)
+        # The message reports the real wait and the limit, and claims no cause.
+        assert "still held after waiting 2." in message
+        assert "limit 2s" in message
+        assert "stuck" not in message
+
+    def test_the_on_loop_wait_is_capped_below_a_long_caller_timeout(
+        self, held_lock: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # A caller ceiling sized for off-loop work must not become a long stall
+        # of every session on the loop.
+        monkeypatch.setattr(platform_compat, "_LOCK_ON_LOOP_MAX_SECS", 0.3)
+        result: dict[str, object] = {}
+
+        async def _acquire_on_loop() -> None:
+            fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                started = time.monotonic()
+                with pytest.raises(OSError) as excinfo:
+                    with platform_compat.file_lock(fd, exclusive=True, timeout=300.0):
+                        pytest.fail("entered the critical section while held")
+                result["waited"] = time.monotonic() - started
+                result["message"] = str(excinfo.value)
+            finally:
+                os.close(fd)
 
         asyncio.run(_acquire_on_loop())
-        # The assertion that matters: zero sleeps on the loop thread. A patched
-        # sleep also means a regression here fails fast instead of stalling.
-        assert slept == []
+        assert 0.3 <= result["waited"] < _TEST_CEILING  # type: ignore[operator]
+        assert "limit 0.3s" in result["message"]  # type: ignore[operator]
 
     def test_an_uncontended_on_loop_acquire_still_succeeds(self, tmp_path: Path):
-        # Single-shot must not mean "always refuse": a free lock is still taken.
+        # A free lock is taken on the first attempt, with no wait.
         taken: list[bool] = []
 
         async def _acquire_free() -> None:
@@ -326,7 +414,7 @@ class TestOnLoopNeverSleeps:
         assert taken == [True]
 
     def test_off_loop_still_polls_and_waits(self, held_lock: Path):
-        # The single-shot rule is scoped to the loop thread: off it, a waiter must
+        # The on-loop cap is scoped to the loop thread: off it, a waiter must
         # still wait out a legitimately long holder rather than racing it.
         fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -381,7 +469,7 @@ class TestAcquireLockCeiling:
         fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             started = time.monotonic()
-            with pytest.raises(OSError, match="stuck"):
+            with pytest.raises(OSError, match="still held"):
                 platform_compat.acquire_lock(fd, exclusive=True)
             assert time.monotonic() - started >= _TEST_CEILING
         finally:
@@ -409,7 +497,7 @@ class TestAgentSpecLockDoesNotHangBoot:
         agents_dir.mkdir()
         proc = _spawn_holder(agents_dir / ".kirocrew-agents.lock")
         try:
-            with pytest.raises(OSError, match="stuck"):
+            with pytest.raises(OSError, match="still held"):
                 with agents_spec_lock(agents_dir):
                     pytest.fail("took the agent-spec lock while another process held it")
         finally:
@@ -486,7 +574,7 @@ class TestLockFailureIsReported:
         proc = _spawn_holder(agents_dir / ".kirocrew-agents.lock")
         try:
             with caplog.at_level("WARNING", logger="kiro_crew.agent"):
-                with pytest.raises(OSError, match="stuck"):
+                with pytest.raises(OSError, match="still held"):
                     with agents_spec_lock(agents_dir):
                         pytest.fail("took the lock while another process held it")
         finally:
@@ -496,7 +584,7 @@ class TestLockFailureIsReported:
                 proc.stdout.close()
 
         messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("stuck" in m for m in messages), messages
+        assert any("still held" in m for m in messages), messages
         assert any(".kirocrew-agents.lock" in m for m in messages), messages
         # The read-only remedy would be wrong advice here: the path IS writable.
         assert not any("KIRO_HOME" in m for m in messages), messages
