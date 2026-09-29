@@ -3,6 +3,7 @@ import { motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronUp, LayoutDashboard } from 'lucide-react'
 import { Btn } from '../../../components/ui'
 import ErrorNotice from '../../../components/ErrorNotice'
+import { Glass } from '../../../components/Glass'
 import { usePersistedBool } from '../../../hooks/usePersistedBool'
 import { fmtNumber } from '../../../i18n/format'
 import { i18nT } from '../../../i18n/t'
@@ -17,7 +18,11 @@ function CommandCenterDock({ slot, onOpen }: { slot: string | null; onOpen: () =
   const [collapsed, setCollapsed] = usePersistedBool('mc-task-dashboard-collapsed', false)
   const reducedMotion = useReducedMotion()
   if (!data.relevant) return null
-  return <motion.div layout transition={{ duration: reducedMotion ? 0 : 0.2 }} className="mx-4 mb-2 rounded-lg border border-border bg-card overflow-hidden relative z-[2]" data-testid="command-center-dock">
+  // The layout-animated box only positions; the visible pane inside it is the
+  // composer dock's glass (components/Glass.tsx), neutral tint like the
+  // composer itself, so the dock no longer sits as one solid card among glass.
+  return <motion.div layout transition={{ duration: reducedMotion ? 0 : 0.2 }} className="mx-4 mb-2 relative z-[2]" data-testid="command-center-dock">
+    <Glass radius={10} className="overflow-hidden">
     <div className="flex items-center gap-2 p-2">
       <Btn className="flex-1 justify-start border-0 min-w-0" onClick={onOpen}>
         <LayoutDashboard size={15} className="text-accent shrink-0" /><span className="truncate">{i18nT('commandCenter.title')}</span>
@@ -35,6 +40,7 @@ function CommandCenterDock({ slot, onOpen }: { slot: string | null; onOpen: () =
         {i18nT('commandCenter.summary', { running: fmtNumber(data.running), blocked: fmtNumber(data.blocked), approvals: fmtNumber(data.approvalCount) })}
       </p>}
     </motion.div>
+    </Glass>
   </motion.div>
 }
 
