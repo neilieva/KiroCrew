@@ -105,6 +105,7 @@ from kiro_crew.acp.session_mcp import (
     session_mcp_disabled_tools,
     session_mcp_server_is_disabled,
 )
+from kiro_crew.acp.state_slots import StateSlot, acquire_state_slot
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
@@ -1943,6 +1944,9 @@ class AcpRuntime:
         # The mask set this spawn asked for, so a trusted corroboration run can
         # exercise the same mounts rather than a weaker profile.
         self._sandbox_hidden_dirs: tuple[str, ...] = ()
+        # The private state slot the harness asked for, held across respawns of
+        # this runtime and released once its process is confirmed killed.
+        self._state_slot: StateSlot | None = None
         # Unroutable-frame drop accounting: (sessionId, method) → count since
         # the last flush, plus the monotonic timestamp of that flush (0.0 = no
         # window open yet; the first counted drop opens it). Written ONLY from
@@ -2245,6 +2249,41 @@ class AcpRuntime:
 
     # ── Lifecycle ──
 
+    def _bind_state_slot(self, env: dict[str, str], request: tuple[str, str] | None) -> None:
+        """Point the host's state variable at this runtime's own slot. Blocking IO.
+
+        A runtime that still holds a slot reuses it, and a freed slot goes to the
+        next runtime lowest-first, so a restart reuses already-built databases. When no slot can be taken, the child
+        gets the host's shared default and a warning says why: a shared database
+        is the behavior before slots existed, and a refused spawn is worse.
+        """
+        if request is None:
+            return
+        env_var, root = request
+        slot = getattr(self, "_state_slot", None)
+        if slot is None or slot.root != Path(root):
+            self._release_state_slot()
+            try:
+                slot = acquire_state_slot(Path(root))
+            except OSError as exc:
+                logger.warning(
+                    "AcpRuntime: no private %s under %s (%s); the child shares the "
+                    "default, so concurrent processes may lock each other out",
+                    env_var,
+                    root,
+                    exc,
+                )
+                return
+            self._state_slot = slot
+        env[env_var] = str(slot.path)
+
+    def _release_state_slot(self) -> None:
+        """Give this runtime's state slot back. Safe when none is held."""
+        slot = getattr(self, "_state_slot", None)
+        self._state_slot = None
+        if slot is not None:
+            slot.release()
+
     def _discard_sandbox_cleanup(self) -> None:
         """Unlink and forget the sandbox temp file allocated by ``wrap_argv``.
 
@@ -2507,6 +2546,9 @@ class AcpRuntime:
         finally:
             process = self._process
             if process is None:
+                # Any exit before a process exists -- an error or a cancellation at
+                # any await -- leaves nothing for kill() to reap, so free the slot.
+                self._release_state_slot()
                 process_state = "absent"
             elif process.returncode is None:
                 process_state = "running"
@@ -2773,8 +2815,26 @@ class AcpRuntime:
             # Called here, before the scrub below, so a host can both add its own
             # variables and remove one this generic path would pass through.
             self._harness.apply_spawn_env(env)
+            # Same hop: taking a private state slot is a mkdir plus a lock.
+            self._bind_state_slot(env, plan.private_state_dir)
 
-        await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
+        env_hop = asyncio.ensure_future(self._to_thread_guarding_sandbox(_resolve_env_off_loop))
+        try:
+            await asyncio.shield(env_hop)
+        except asyncio.CancelledError:
+            # The thread cannot be interrupted, and a cancellation that unwinds
+            # past it would reach spawn()'s cleanup before the thread stores the
+            # slot it is taking, leaving that slot locked forever. Wait it out
+            # (through any further cancellation), then free the slot and the
+            # sandbox file the shielded guard did not get to discard.
+            while not env_hop.done():
+                try:
+                    await asyncio.wait({env_hop})
+                except asyncio.CancelledError:
+                    continue
+            self._release_state_slot()
+            self._discard_sandbox_cleanup()
+            raise
         # Parent-side equivalent of the launcher scrub. This is required on
         # Windows where the positively classified Kiro backend delegates to the
         # CLI's internal sandbox without a POSIX `env -u` wrapper. Do it after
@@ -3568,6 +3628,10 @@ class AcpRuntime:
         self._process_tree_confirmed_dead = False
         try:
             await self._kill_inner(expected=expected, reason=reason)
+            # Only once the whole tree is confirmed gone: a survivor still has the
+            # slot's databases open, so the next runtime must not be handed it.
+            if self._process_tree_confirmed_dead:
+                self._release_state_slot()
         finally:
             self._discard_sandbox_cleanup()
             await self._discard_bound_workspace()

@@ -127,7 +127,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from kiro_crew import acp_tool_gate
 from kiro_crew.acp.harness._common import MembershipHarness
@@ -157,6 +157,34 @@ logger = logging.getLogger(__name__)
 #: claude's today: a divergence should be a one-line edit here rather than a silent
 #: downgrade of whichever harness moved first.
 PROTOCOL_VERSION_CODEX = 1
+
+
+#: Where ``codex`` keeps its SQLite databases; defaults to ``CODEX_HOME``.
+_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
+
+
+def sqlite_slot_root(environ: Mapping[str, str], home: Path) -> Path:
+    """The directory each runtime's private SQLite slot is taken under.
+
+    Every ``codex app-server`` opens the same SQLite files by default, and they
+    lock each other out: a Codex Desktop daemon plus two Crew runtimes fail new
+    sessions with ``database is locked``. So each runtime gets its own
+    ``CODEX_SQLITE_HOME``.
+
+    Only the databases move. Config, auth and the thread rollouts stay in the
+    shared ``CODEX_HOME``, and a thread resumes from its rollout -- measured on
+    codex 0.159: a thread started under one SQLite home and resumed under an
+    empty one recalled the first turn. So ``spawn_continue`` still works across
+    runtimes. Slots are reused rather than minted per spawn, because a fresh home
+    backfills every rollout into ~60 MB of index on its first start.
+
+    The slots sit beside the databases they replace: under the operator's own
+    ``CODEX_SQLITE_HOME`` when set, else ``CODEX_HOME``, else ``~/.codex``. A
+    ``sqlite_home`` in ``config.toml`` outranks the variable; an operator who sets
+    it has chosen that location, and Crew does not override it.
+    """
+    base = environ.get(_SQLITE_HOME_ENV) or environ.get("CODEX_HOME") or str(home / ".codex")
+    return Path(base) / "kirocrew-sqlite"
 
 
 def _sandbox_wrapper_generations(sandbox_mode: str) -> int:
@@ -281,6 +309,7 @@ class CodexHarness(MembershipHarness):
             rss_depth=self.CORE_RSS_DEPTH + wrapper_generations,
             extra_hidden_dirs=hidden,
             extra_expose_files=expose,
+            private_state_dir=(_SQLITE_HOME_ENV, str(sqlite_slot_root(ctx.environ, ctx.home))),
         )
 
     def apply_spawn_env(self, env: dict[str, str]) -> None:
