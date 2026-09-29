@@ -198,10 +198,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Omit ``parent`` (or pass 'root') for a top-level folder. Creating a "
                 "folder never moves anything — file sessions into it with "
                 "chat_folder_move_session. An app agent may create at the top level "
-                "or inside a folder it created itself, and the new folder belongs to "
-                "it; creating inside one of the person's folders is refused. A crew "
-                "member follows the same rule: it owns the folders it creates and "
-                "may nest only under its own."
+                "inside a folder it created itself, or directly inside the folder "
+                "its own session is filed in; the new folder belongs to it. Creating "
+                "anywhere else in the person's folders is refused. A crew member "
+                "follows the same rule. An existing same-name folder of yours is "
+                "reused; one that is not yours is refused, never duplicated."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1497,6 +1498,15 @@ def _walk_chat_folder_segments(
             )
         if made.get("error"):
             return "", created, str(made["error"])
+        if made.get("reused"):
+            # The endpoint handed back this caller's own same-name folder, which
+            # a concurrent walk created after our read. Nothing new exists.
+            made = {k: v for k, v in made.items() if k != "reused"}
+            if not any(str(f.get("id") or "") == str(made.get("id") or "") for f in folders):
+                folders.append(made)
+            walked = str(made.get("id") or "")
+            parent = walked
+            continue
         folders.append(made)
         created.append(str(made.get("name") or seg))
         walked = str(made.get("id") or "")
