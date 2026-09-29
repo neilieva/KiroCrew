@@ -11138,7 +11138,21 @@
         "moment_model_selected": "modelo elegido",
         "moment_write_dropped": "entradas perdidas",
         "moment_approval_requested": "aprobación solicitada",
-        "moment_approval_decided": "aprobación respondida"
+        "moment_approval_decided": "aprobación respondida",
+        "section_subagents": "Subagentes",
+        "summary_subagents": "lanzados: {{spawned}} · en curso: {{open}}",
+        "subagents_empty": "No se lanzaron subagentes.",
+        "stat_spawned": "subagentes lanzados",
+        "col_agent": "subagente",
+        "col_outcome": "resultado",
+        "outcome_completed": "terminado",
+        "outcome_failed": "falló",
+        "outcome_stopped": "detenido",
+        "outcome_unknown": "desconocido",
+        "outcome_running": "en curso",
+        "credits_not_reported": "sin informar",
+        "subagents_undetailed": "{{count}} más contados arriba, no listados aquí",
+        "subagents_undetailed_running": "{{count}} más contados arriba, no listados aquí ({{running}} siguen en curso)"
       },
       "decisionStrip": {
         "steer_confidence": "confianza {{p}}",

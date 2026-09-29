@@ -20,7 +20,7 @@ being able to touch it.
 |---|---|
 | `crew_log_list` | One row per session log on this host: unit, slot, agent, model, first and last entry time, last seq, whether the session is open. `with_type_counts=True` adds the per-type histogram, per unit and across the listing. |
 | `crew_log_read` | A range of entries as `{seq, ts, type, data}`, each citation resolved to its verdict and span, with `next_from` when more follows. |
-| `crew_log_projection` | One fold and the seq it was folded through: `status`, `usage`, `timeline`, `tools`, `approvals`. |
+| `crew_log_projection` | One fold and the seq it was folded through: `status`, `usage`, `timeline`, `tools`, `approvals`, `subagents`. |
 
 There is no write tool, and none may be added: `test/test_mcp_crew_log.py` ratchets
 the set to exactly these three names, so adding one fails a test rather than

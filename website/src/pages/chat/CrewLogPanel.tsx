@@ -25,7 +25,7 @@
  * footer reports the highest of the five, which is what makes "this value is
  * older than the log" observable instead of implied.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react'
 import { api } from '../../api/client'
@@ -37,7 +37,7 @@ import { fmtCompact, fmtElapsed, fmtNumber, fmtPercent, fmtTimeNumeric } from '.
 import { splitOnPlaceholder } from '../../lib/splitOnPlaceholder'
 
 /** The five folds, in the order the backend declares them (`PROJECTION_NAMES`). */
-export const CREW_LOG_FOLDS = ['status', 'usage', 'timeline', 'tools', 'approvals'] as const
+export const CREW_LOG_FOLDS = ['status', 'usage', 'timeline', 'tools', 'approvals', 'subagents'] as const
 export type CrewLogFold = (typeof CREW_LOG_FOLDS)[number]
 
 /** One fold's value at the seq it was folded through. */
@@ -555,6 +555,143 @@ function ApprovalsBody({ value }: { value: Record<string, unknown> }) {
   )
 }
 
+function outcomeLabel(outcome: string): string {
+  const key = `pages.chat.crewLog.outcome_${outcome}`
+  const label = i18nT(key)
+  // An OPEN enum: the fold passes the runtime's own word through rather than clamping
+  // it, so a value this build has no wording for is drawn as itself instead of as a
+  // missing translation key.
+  return label === key ? outcome : label
+}
+
+function SubagentsBody({ value }: { value: Record<string, unknown> }) {
+  const byId = obj(value.by_id)
+  const children = Object.entries(byId)
+  const rows = children.slice(0, TABLE_ROWS)
+  const totals = obj(value.totals)
+  // ONE reconciliation line, because the reader has one question: why are there fewer rows
+  // than the header counts. It reports children DISPATCHED but not listed, which is
+  // `omitted` plus whatever this table trimmed itself.
+  //
+  // Deliberately NOT `omitted + closed_unmatched`: those two are not disjoint. A dispatch
+  // dropped past the cap whose closer arrives later raises BOTH, so adding them counts that
+  // child twice. `closed_unmatched` is a fold-level diagnostic and stays in `totals` for a
+  // reader of the projection; it answers a different question than this line.
+  const undetailed = notShown(children.length, rows.length, int(value.omitted))
+  // How many of the unlisted ones are still going. Exact by construction: `running` comes
+  // from the totals and the listed count comes from the rows, so the difference is the
+  // running children absent from this table however they came to be absent. Without it the
+  // header can read "running: 12" above a single running row with no way to follow it.
+  const listedRunning = rows.filter(([, raw]) => !str(obj(raw).outcome)).length
+  const runningUndetailed = Math.max(0, int(value.running) - listedRunning)
+  if (int(totals.spawned) === 0) {
+    return <div className="text-[11.5px] text-muted py-1">{i18nT('pages.chat.crewLog.subagents_empty')}</div>
+  }
+  return (
+    <>
+      {/* ONE tile. An aggregate subagent-credits tile used to sit beside this and was
+          removed: it put a second money number on a panel that already shows Usage's
+          credits, which then needed a label stating its coverage and a hint stating its
+          relationship to that total -- two mechanisms whose only job was to explain a
+          figure the per-child credits column already gives exactly. */}
+      <Stat value={count(totals.spawned)} label={i18nT('pages.chat.crewLog.stat_spawned')} />
+      <table className="w-full border-collapse mt-2.5">
+        <thead>
+          <tr>
+            <th className="text-left font-normal text-muted text-[10.5px] py-[3px] border-b border-border">{i18nT('pages.chat.crewLog.col_agent')}</th>
+            <th className="text-left font-normal text-muted text-[10.5px] py-[3px] border-b border-border">{i18nT('pages.chat.crewLog.col_model')}</th>
+            <th className="text-left font-normal text-muted text-[10.5px] py-[3px] border-b border-border">{i18nT('pages.chat.crewLog.col_outcome')}</th>
+            <th className="text-right font-normal text-muted text-[10.5px] py-[3px] border-b border-border">{i18nT('pages.chat.crewLog.col_elapsed')}</th>
+            <th className="text-right font-normal text-muted text-[10.5px] py-[3px] border-b border-border">{i18nT('pages.chat.crewLog.col_credits')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([agentId, raw]) => {
+            const row = obj(raw)
+            const outcome = str(row.outcome)
+            const charge = num(row.credits)
+            const elapsed = num(row.ms)
+            const reason = str(row.reason)
+            // Whether this outcome is a FAILURE, which is the one question that decides
+            // how its reason is drawn. `completed` and `stopped` are not failures -- the
+            // emitter's own contract is that a run the user stopped must not read as one --
+            // so everything else (`failed`, and any `unknown` or unrecognised value from
+            // the open enum) is.
+            const failed = !!outcome && outcome !== 'completed' && outcome !== 'stopped'
+            return (
+              <Fragment key={agentId}>
+              <tr>
+                <td className="py-[3px] border-b border-border text-text truncate max-w-[110px]">{str(row.agent) || agentId}</td>
+                <td className="py-[3px] border-b border-border text-muted truncate max-w-[80px]">{str(row.model) || '—'}</td>
+                <td className="py-[3px] border-b border-border">
+                  {outcome
+                    ? <Pill tone={outcome === 'completed' ? 'accent' : outcome === 'stopped' ? 'muted' : 'danger'}>{outcomeLabel(outcome)}</Pill>
+                    : <Pill tone="warn">{i18nT('pages.chat.crewLog.outcome_running')}</Pill>}
+                </td>
+                {/* A duration is absent in TWO cases, and neither is zero: a child still
+                    running has no closer yet, and a closer writes `ms` only when it measured
+                    one above zero -- crash-repair's closer writes none at all. So the cell
+                    reads the value's presence, not the outcome's: `0.0s` for either would
+                    present an absent measurement as a measured instant. */}
+                <td className="py-[3px] border-b border-border text-right tabular-nums">
+                  {elapsed === null ? '—' : fmtElapsed(elapsed)}
+                </td>
+                {/* THREE states, and all three are DRAWN differently: a charge; a child
+                    that closed reporting none; and a child still running, which gets the
+                    same dash the elapsed cell gets, because its cost is not knowable yet
+                    rather than withheld. */}
+                <td className="py-[3px] border-b border-border text-right tabular-nums text-muted">
+                  {!outcome
+                    ? '—'
+                    : charge === null
+                      ? i18nT('pages.chat.crewLog.credits_not_reported')
+                      : fmtNumber(charge, { maximumFractionDigits: 2 })}
+                </td>
+              </tr>
+              {/* The closer's own reason, on its own full-width row so it can be READ.
+                  Only a child that did not finish carries one.
+
+                  The CONTAINER is chosen by the outcome, not by whether a reason exists.
+                  A genuine failure is an error value, so it renders through ErrorNotice
+                  with the askAgent hand-off -- `errors-use-error-notice` tests where the
+                  value came from, and a read-only status panel has no draft the hand-off
+                  could destroy. A run the OWNER stopped did not fail: the emitter's
+                  contract says it must not read as one, and the rule itself excludes
+                  status text about something that has not failed. Dressing it in a red
+                  triangle and an "Ask the agent" button contradicted the neutral Pill one
+                  line above it. */}
+              {reason && (failed ? (
+                <tr>
+                  <td colSpan={5} className="pb-[3px] border-b border-border">
+                    <ErrorNotice message={reason} askAgent variant="inline" />
+                  </td>
+                </tr>
+              ) : (
+                <tr>
+                  <td colSpan={5} className="pb-[3px] border-b border-border text-[10.5px] text-muted">
+                    {reason}
+                  </td>
+                </tr>
+              ))}
+              </Fragment>
+            )
+          })}
+        </tbody>
+      </table>
+      {undetailed > 0 && (
+        <div className="text-[10.5px] text-muted pt-1.5">
+          {runningUndetailed > 0
+            ? i18nT('pages.chat.crewLog.subagents_undetailed_running', {
+              count: fmtNumber(undetailed),
+              running: fmtNumber(runningUndetailed),
+            })
+            : i18nT('pages.chat.crewLog.subagents_undetailed', { count: fmtNumber(undetailed) })}
+        </div>
+      )}
+    </>
+  )
+}
+
 /* ── summaries drawn in a collapsed header ────────────────────────────────── */
 
 function summaryFor(fold: CrewLogFold, value: Record<string, unknown>): string {
@@ -587,9 +724,20 @@ function summaryFor(fold: CrewLogFold, value: Record<string, unknown>): string {
       open: fmtNumber(int(value.open)),
     })
   }
-  return i18nT('pages.chat.crewLog.summary_approvals', {
-    requested: fmtNumber(int(value.requested)),
-    pending: fmtNumber(int(value.pending)),
+  if (fold === 'approvals') {
+    return i18nT('pages.chat.crewLog.summary_approvals', {
+      requested: fmtNumber(int(value.requested)),
+      pending: fmtNumber(int(value.pending)),
+    })
+  }
+  // `spawned` rather than the row count: it is every child the session dispatched,
+  // which is the number a reader is scanning this header for, and it exceeds the rows
+  // by `omitted` on a session that dispatched past the retention cap.
+  // `running` rather than `open.length`: the fold derives it from the totals, so it stays
+  // exact once retention has dropped a dispatch, where the retained `open` list cannot.
+  return i18nT('pages.chat.crewLog.summary_subagents', {
+    spawned: fmtNumber(int(obj(value.totals).spawned)),
+    open: fmtNumber(int(value.running)),
   })
 }
 
@@ -599,11 +747,12 @@ const SECTION_TITLE_KEY: Record<CrewLogFold, string> = {
   timeline: 'pages.chat.crewLog.section_timeline',
   tools: 'pages.chat.crewLog.section_tools',
   approvals: 'pages.chat.crewLog.section_approvals',
+  subagents: 'pages.chat.crewLog.section_subagents',
 }
 
-/** Sections open on first render: the two that fit without scrolling. The three
+/** Sections open on first render: the two that fit without scrolling. The four
  *  list folds stay closed — their headers already carry the count a reader is
- *  scanning for, and opening all five would put a 200-row feed above them. */
+ *  scanning for, and opening all six would put a 200-row feed above them. */
 const OPEN_BY_DEFAULT: CrewLogFold[] = ['status', 'usage']
 
 /* ── the section ──────────────────────────────────────────────────────────── */
@@ -750,6 +899,7 @@ export function CrewLogTab({ slot }: { slot: string }) {
               {fold === 'timeline' && <TimelineBody value={value} />}
               {fold === 'tools' && <ToolsBody value={value} />}
               {fold === 'approvals' && <ApprovalsBody value={value} />}
+              {fold === 'subagents' && <SubagentsBody value={value} />}
             </Section>
           )
         })}

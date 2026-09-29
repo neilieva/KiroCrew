@@ -11293,7 +11293,21 @@
         "moment_model_selected": "модель выбрана",
         "moment_write_dropped": "записи потеряны",
         "moment_approval_requested": "запрошено подтверждение",
-        "moment_approval_decided": "подтверждение дано"
+        "moment_approval_decided": "подтверждение дано",
+        "section_subagents": "Субагенты",
+        "summary_subagents": "запущено: {{spawned}} · работает: {{open}}",
+        "subagents_empty": "Субагенты не запускались.",
+        "stat_spawned": "запущено субагентов",
+        "col_agent": "субагент",
+        "col_outcome": "итог",
+        "outcome_completed": "завершён",
+        "outcome_failed": "сбой",
+        "outcome_stopped": "остановлен",
+        "outcome_unknown": "неизвестно",
+        "outcome_running": "работает",
+        "credits_not_reported": "не сообщено",
+        "subagents_undetailed": "ещё {{count}} учтены выше, здесь не показаны",
+        "subagents_undetailed_running": "ещё {{count}} учтены выше, здесь не показаны (из них {{running}} ещё работают)"
       },
       "decisionStrip": {
         "steer_confidence": "уверенность {{p}}",

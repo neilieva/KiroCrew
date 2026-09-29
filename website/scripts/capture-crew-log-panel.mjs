@@ -131,6 +131,36 @@ const POPULATED = {
     by_decision: { approved: 3 },
     last: { approval_id: 'a-3', decision: 'approved', by: 'owner', cause: '', tool: 'fs_write', turn: 11, time: 1789821900000, seq: 1700 },
   }),
+  // Three children, one per state the credits and elapsed cells have to tell apart:
+  // finished having reported a charge, closed having reported none, and still running.
+  // A fixture with only the first would photograph the one case that cannot go wrong.
+  subagents: fold('subagents', 1842, {
+    by_id: {
+      'sub-1': {
+            agent_id: 'sub-1', seq_spawned: 1204,
+        agent: 'kirocrew-worker', model: 'a-model',
+        outcome: 'completed', ms: 412000, credits: 3.18, reason: '',
+      },
+      'sub-2': {
+            agent_id: 'sub-2', seq_spawned: 1388,
+        agent: 'kirocrew-lite', model: 'another-model',
+        outcome: 'stopped', ms: 9400, credits: null, reason: 'the owner stopped it',
+      },
+      'sub-3': {
+            agent_id: 'sub-3', seq_spawned: 1836,
+        agent: 'kirocrew-worker', model: 'a-model',
+        outcome: null, ms: null, credits: null, reason: '',
+      },
+    },
+    open: ['sub-3'],
+    running: 1,
+    omitted: 0,
+    limit: 512,
+    totals: {
+      spawned: 3, completed: 1, failed: 0, stopped: 1, unknown: 0,
+      closed_unmatched: 0, ms: 421400, ms_reported: 2, credits: 3.18, credits_reported: 1,
+    },
+  }),
 }
 
 /** Every fold at seq 0 — what a session with no crew log reads back. */
@@ -267,12 +297,13 @@ async function main() {
       console.log(`${theme}: data-theme=${rendered.theme} --bg=${rendered.bg}`)
       const text = await sectionText(page)
       assertContains(`populated/${theme}`, text, [
-        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals',
+        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals', 'Subagents',
         // The count line names no actor: the reader of a tile has nowhere to learn
         // what the gateway is, and the empty state is where that word is earned.
         'completed: 12 · refused: 1',
         'calls: 96 · unfinished: 2',
         'asked: 4 · pending: 1',
+        'dispatched: 3 · running: 1',
         'up to date through entry 1,842',
       ])
       if (theme === 'light') {
@@ -313,6 +344,125 @@ async function main() {
         'Waiting for you', 'Answer these on the approval card in the conversation.',
       ])
       await shootPanel(page, 'crew-log-folds')
+      await context.close()
+    }
+
+    {
+      // The subagents table, which no other frame opens. What it has to prove is the
+      // credits and elapsed cells telling THREE states apart -- a reported charge, a
+      // child that reported none, and a child still running -- because a zero in
+      // either column would present the absence of a measurement as a measurement.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: POPULATED,
+        open: ['Subagents'],
+        // Status and Usage open themselves and together are taller than the column,
+        // so the table would sit below the fold in the frame that is about it.
+        close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents/dark', text, [
+        'subagents dispatched',
+        'subagent', 'model', 'outcome', 'elapsed', 'credits',
+        'kirocrew-worker', 'kirocrew-lite', 'another-model',
+        'finished', 'stopped', 'running',
+        // The middle state, which is the one a panel gets wrong.
+        'not reported',
+      ])
+      // CHILD rows only: a child that did not finish also emits a full-width row carrying
+      // its closer's reason, which has one cell rather than five.
+      const { rows, reasons } = await page.evaluate(() => {
+        const table = [...document.querySelectorAll('[data-testid="crew-log-tab"] table')]
+          .find(t => t.textContent?.includes('outcome'))
+        const all = [...(table?.querySelectorAll('tbody tr') ?? [])].map(tr =>
+          [...tr.querySelectorAll('td')].map(td => td.textContent?.trim() ?? ''))
+        return { rows: all.filter(r => r.length === 5), reasons: all.filter(r => r.length === 1) }
+      })
+      if (rows.length !== 3) {
+        throw new Error(`subagents: ${rows.length} row(s) drawn, expected 3`)
+      }
+      // The reason row is what gives the retained `reason` field a readable consumer.
+      if (!reasons.some(r => r[0].includes('the owner stopped it'))) {
+        throw new Error(`subagents: no reason row drawn: ${JSON.stringify(reasons)}`)
+      }
+      // Dispatch order, which is the order the fold renders and the order a reader of a
+      // session's history expects. Matched with startsWith, not equality: the agent cell
+      // carries a second line (the turn, the steer count, a failure's reason), so its full
+      // text is the name followed by that detail.
+      if (!rows[0][0].startsWith('kirocrew-worker') || !rows[1][0].startsWith('kirocrew-lite')) {
+        throw new Error(`subagents: rows out of dispatch order: ${JSON.stringify(rows)}`)
+      }
+
+      // The running child: neither a charge nor a duration is known yet, and drawing
+      // 0 for either is the defect this assertion exists for.
+      // The running child draws a dash in BOTH numeric cells: neither its duration nor
+      // its cost is knowable until a closer lands.
+      if (rows[2][3] !== '—' || rows[2][4] !== '—') {
+        throw new Error(`subagents: running child drew ${JSON.stringify(rows[2])}`)
+      }
+      if (rows[1][4] !== 'not reported') {
+        throw new Error(`subagents: an unreported charge drew ${JSON.stringify(rows[1])}`)
+      }
+      if (rows[0][4] === 'not reported') {
+        throw new Error(`subagents: a REPORTED charge drew "not said": ${JSON.stringify(rows[0])}`)
+      }
+      await shootPanel(page, 'crew-log-subagents')
+      await context.close()
+    }
+
+    {
+      // The two reason CONTAINERS side by side, which is the whole point of gating on the
+      // outcome rather than on whether a reason exists: a genuine failure earns the error
+      // surface and its hand-off, while a run the owner stopped is status text. A frame
+      // showing only one of them cannot prove the distinction holds.
+      const FAILED = structuredClone(POPULATED)
+      FAILED.subagents.value.by_id['sub-1'].outcome = 'failed'
+      FAILED.subagents.value.by_id['sub-1'].reason = 'the child could not reach the gateway'
+      Object.assign(FAILED.subagents.value.totals, { completed: 0, failed: 1 })
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: FAILED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents-failed/dark', text, [
+        'the child could not reach the gateway',
+        'the owner stopped it',
+      ])
+      const containers = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-testid="crew-log-tab"] tbody tr')]
+        const find = (needle) => rows.find(r => (r.textContent || '').includes(needle))
+        const failed = find('could not reach the gateway')
+        const stopped = find('the owner stopped it')
+        return {
+          failedHasAlert: !!failed?.querySelector('[role="alert"]'),
+          stoppedHasAlert: !!stopped?.querySelector('[role="alert"]'),
+        }
+      })
+      if (!containers.failedHasAlert) {
+        throw new Error('subagents: a genuine failure did not render the error surface')
+      }
+      if (containers.stoppedHasAlert) {
+        throw new Error('subagents: a deliberate stop was dressed as an error')
+      }
+      await shootPanel(page, 'crew-log-subagents-failed')
+      await context.close()
+    }
+
+    {
+      // The subagents fold past its retention cap, plus a closer that matched no
+      // dispatch. Both lines exist so the totals exceeding what the table accounts
+      // for reads as the bound speaking rather than as an arithmetic bug.
+      const CAPPED = structuredClone(POPULATED)
+      Object.assign(CAPPED.subagents.value, { omitted: 11, running: 12 })
+      Object.assign(CAPPED.subagents.value.totals, { spawned: 14 })
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: CAPPED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents-capped/dark', text, [
+        '11 more counted above, not listed here (11 still running)',
+        // The header counts every dispatch, not the three rows below it.
+        'dispatched: 14 · running: 12',
+      ])
+      await shootPanel(page, 'crew-log-subagents-capped')
       await context.close()
     }
 

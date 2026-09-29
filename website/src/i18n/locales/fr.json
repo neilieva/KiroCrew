@@ -11138,7 +11138,21 @@
         "moment_model_selected": "modèle choisi",
         "moment_write_dropped": "entrées perdues",
         "moment_approval_requested": "validation demandée",
-        "moment_approval_decided": "validation tranchée"
+        "moment_approval_decided": "validation tranchée",
+        "section_subagents": "Sous-agents",
+        "summary_subagents": "lancés : {{spawned}} · en cours : {{open}}",
+        "subagents_empty": "Aucun sous-agent lancé.",
+        "stat_spawned": "sous-agents lancés",
+        "col_agent": "sous-agent",
+        "col_outcome": "résultat",
+        "outcome_completed": "terminé",
+        "outcome_failed": "échec",
+        "outcome_stopped": "arrêté",
+        "outcome_unknown": "inconnu",
+        "outcome_running": "en cours",
+        "credits_not_reported": "non signalé",
+        "subagents_undetailed": "{{count}} autres comptés ci-dessus, non listés ici",
+        "subagents_undetailed_running": "{{count}} autres comptés ci-dessus, non listés ici ({{running}} encore en cours)"
       },
       "decisionStrip": {
         "steer_confidence": "confiance {{p}}",

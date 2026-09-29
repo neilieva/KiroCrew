@@ -10828,7 +10828,21 @@
         "moment_model_selected": "已选择模型",
         "moment_write_dropped": "条目丢失",
         "moment_approval_requested": "请求审批",
-        "moment_approval_decided": "审批已回复"
+        "moment_approval_decided": "审批已回复",
+        "section_subagents": "子代理",
+        "summary_subagents": "已派发：{{spawned}} · 进行中：{{open}}",
+        "subagents_empty": "没有派发过子代理。",
+        "stat_spawned": "已派发子代理",
+        "col_agent": "子代理",
+        "col_outcome": "结果",
+        "outcome_completed": "已完成",
+        "outcome_failed": "失败",
+        "outcome_stopped": "已停止",
+        "outcome_unknown": "未知",
+        "outcome_running": "进行中",
+        "credits_not_reported": "未报告",
+        "subagents_undetailed": "另有 {{count}} 个已算进上面合计，这里没列出",
+        "subagents_undetailed_running": "另有 {{count}} 个已算进上面合计，这里没列出（其中 {{running}} 个还在跑）"
       },
       "decisionStrip": {
         "steer_confidence": "置信度 {{p}}",

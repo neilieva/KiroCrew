@@ -10828,7 +10828,21 @@
         "moment_model_selected": "モデルを選択",
         "moment_write_dropped": "エントリが失われた",
         "moment_approval_requested": "承認を要求",
-        "moment_approval_decided": "承認に回答"
+        "moment_approval_decided": "承認に回答",
+        "section_subagents": "サブエージェント",
+        "summary_subagents": "起動: {{spawned}} · 実行中: {{open}}",
+        "subagents_empty": "サブエージェントは起動していません。",
+        "stat_spawned": "起動したサブエージェント",
+        "col_agent": "サブエージェント",
+        "col_outcome": "結果",
+        "outcome_completed": "完了",
+        "outcome_failed": "失敗",
+        "outcome_stopped": "停止",
+        "outcome_unknown": "不明",
+        "outcome_running": "実行中",
+        "credits_not_reported": "報告なし",
+        "subagents_undetailed": "他に {{count}} 件は上の合計に入っていますが、ここには出していません",
+        "subagents_undetailed_running": "他に {{count}} 件は上の合計に入っていますが、ここには出していません（うち {{running}} 件は実行中）"
       },
       "decisionStrip": {
         "steer_confidence": "確信度 {{p}}",

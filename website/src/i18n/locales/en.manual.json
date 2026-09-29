@@ -4629,7 +4629,21 @@
         "moment_model_selected": "model chosen",
         "moment_write_dropped": "entries lost",
         "moment_approval_requested": "approval asked",
-        "moment_approval_decided": "approval answered"
+        "moment_approval_decided": "approval answered",
+        "section_subagents": "Subagents",
+        "summary_subagents": "dispatched: {{spawned}} · running: {{open}}",
+        "subagents_empty": "No subagents dispatched.",
+        "stat_spawned": "subagents dispatched",
+        "col_agent": "subagent",
+        "col_outcome": "outcome",
+        "outcome_completed": "finished",
+        "outcome_failed": "failed",
+        "outcome_stopped": "stopped",
+        "outcome_unknown": "unknown",
+        "outcome_running": "running",
+        "credits_not_reported": "not reported",
+        "subagents_undetailed": "{{count}} more counted above, not listed here",
+        "subagents_undetailed_running": "{{count}} more counted above, not listed here ({{running}} still running)"
       },
       "decisionStrip": {
         "steer_confidence": "confidence {{p}}",

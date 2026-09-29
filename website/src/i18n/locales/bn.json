@@ -10983,7 +10983,21 @@
         "moment_model_selected": "মডেল নির্বাচিত",
         "moment_write_dropped": "এন্ট্রি হারিয়েছে",
         "moment_approval_requested": "অনুমোদন চাওয়া হয়েছে",
-        "moment_approval_decided": "অনুমোদনের উত্তর দেওয়া হয়েছে"
+        "moment_approval_decided": "অনুমোদনের উত্তর দেওয়া হয়েছে",
+        "section_subagents": "সাবএজেন্ট",
+        "summary_subagents": "পাঠানো: {{spawned}} · চলছে: {{open}}",
+        "subagents_empty": "কোনো সাবএজেন্ট পাঠানো হয়নি।",
+        "stat_spawned": "পাঠানো সাবএজেন্ট",
+        "col_agent": "সাবএজেন্ট",
+        "col_outcome": "ফলাফল",
+        "outcome_completed": "শেষ হয়েছে",
+        "outcome_failed": "ব্যর্থ",
+        "outcome_stopped": "থামানো",
+        "outcome_unknown": "অজানা",
+        "outcome_running": "চলছে",
+        "credits_not_reported": "জানানো হয়নি",
+        "subagents_undetailed": "আরও {{count}}টি উপরে গোনা আছে, এখানে দেখানো হয়নি",
+        "subagents_undetailed_running": "আরও {{count}}টি উপরে গোনা আছে, এখানে দেখানো হয়নি ({{running}}টি এখনও চলছে)"
       },
       "decisionStrip": {
         "steer_confidence": "আত্মবিশ্বাস {{p}}",

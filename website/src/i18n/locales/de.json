@@ -10983,7 +10983,21 @@
         "moment_model_selected": "Modell gewählt",
         "moment_write_dropped": "Einträge verloren",
         "moment_approval_requested": "Freigabe angefragt",
-        "moment_approval_decided": "Freigabe beantwortet"
+        "moment_approval_decided": "Freigabe beantwortet",
+        "section_subagents": "Subagenten",
+        "summary_subagents": "gestartet: {{spawned}} · laufend: {{open}}",
+        "subagents_empty": "Keine Subagenten gestartet.",
+        "stat_spawned": "gestartete Subagenten",
+        "col_agent": "Subagent",
+        "col_outcome": "Ergebnis",
+        "outcome_completed": "fertig",
+        "outcome_failed": "fehlgeschlagen",
+        "outcome_stopped": "gestoppt",
+        "outcome_unknown": "unbekannt",
+        "outcome_running": "läuft",
+        "credits_not_reported": "nicht gemeldet",
+        "subagents_undetailed": "{{count}} weitere sind oben gezählt, hier nicht aufgeführt",
+        "subagents_undetailed_running": "{{count}} weitere sind oben gezählt, hier nicht aufgeführt ({{running}} laufen noch)"
       },
       "decisionStrip": {
         "steer_confidence": "Zuversicht {{p}}",

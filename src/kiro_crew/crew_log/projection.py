@@ -144,6 +144,7 @@ PROJECTION_NAMES: Final[tuple[str, ...]] = (
     "timeline",
     "tools",
     "approvals",
+    "subagents",
 )
 
 #: Folds this module registers but does NOT advertise: no panel draws them and the
@@ -1374,6 +1375,34 @@ def _usage_start() -> dict[str, Any]:
     }
 
 
+def _credit_charge(value: Any) -> float | None:
+    """*value* as a credit charge this module can arithmetic on, else ``None``.
+
+    THE module's one screen for a charge coming off the wire, shared by every fold that
+    reads a ``credits`` field -- ``usage`` through :func:`_bill_credits`, and ``subagents``
+    per row. Spelled once because it is one question, and two spellings of it drift: the
+    second would be the one that forgets a case.
+
+    Two shapes get through a naive check. ``bool`` is an ``int`` in Python, so ``True``
+    would bill as one credit. And a JSON integer is UNBOUNDED while a ``float`` is not, so
+    ``float(10 ** 400)`` raises ``OverflowError`` rather than returning a wrong number --
+    and nothing between here and :func:`fold_session` catches it, so an escaping raise
+    would cost the whole projection over one line that stays on disk for good. A line this
+    module cannot interpret costs that line and nothing else.
+
+    Deliberately does NOT screen the VALUE for sign, NaN or infinity. That is the caller's
+    business and belongs on the RESULT: a charge has many unusable shapes and an
+    accumulated total has one invariant (stay finite, never go down), so checking the total
+    needs one clause where checking the charge needs a clause per shape.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (OverflowError, ValueError):
+        return None
+
+
 def _bill_credits(state: dict[str, Any], entry: Entry) -> float | None:
     """Add this entry's charge to the session total and to its own source bucket.
 
@@ -1390,17 +1419,8 @@ def _bill_credits(state: dict[str, Any], entry: Entry) -> float | None:
     source = _CREDIT_SOURCE_OF.get(entry.type)
     if source is None:
         return None
-    credits = entry.data.get("credits")
-    if not isinstance(credits, (int, float)) or isinstance(credits, bool):
-        return None
-    try:
-        billed = float(credits)
-    except (OverflowError, ValueError):
-        # A JSON integer is unbounded, so a charge can be unrepresentable rather
-        # than merely wrong -- ``float(10 ** 400)`` raises. Nothing between here and
-        # ``fold_session`` catches it, so letting it escape would cost the whole
-        # projection over one line. A line this fold cannot interpret costs that
-        # line and nothing else.
+    billed = _credit_charge(entry.data.get("credits"))
+    if billed is None:
         return None
     bucket = state["credits_by_source"][source]
     total = state["credits"] + billed
@@ -1887,6 +1907,233 @@ def _approvals_render(state: dict[str, Any]) -> dict[str, Any]:
         "unmatched_decisions": state["unmatched_decisions"],
         "by_decision": dict(sorted(state["by_decision"].items())),
         "last": dict(state["last"]) if state["last"] else None,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# subagents
+# --------------------------------------------------------------------------- #
+#
+# WHAT THIS FOLD IS FOR. "Which children did this session dispatch, and for each one
+# what happened, how long it ran and what it cost" -- answered from one savepoint read
+# rather than from a 200-entry ``timeline`` window that happens to have swallowed the
+# four ``subagent/*`` types along with everything else.
+#
+# The same number lives in five places besides this one -- the runtime accumulator, the
+# terminal tombstone, the persistence record, the WS frame and its replay, and the
+# browser store -- and keeping those five agreeing is where a reader's numbers go wrong.
+# This fold is the one that is DERIVED from the log, so it cannot disagree with the
+# record without the record itself being wrong.
+
+
+#: Outcomes this fold counts under their own name. ``subagent/failed`` carries an OPEN
+#: enum, deliberately: the value is the subagent runtime's own, and enforcing the set
+#: would turn "the upstream vocabulary grew" into a lost record. So a closer whose
+#: outcome is not one of these lands in ``unknown``, which is what the declaration
+#: already means by it -- the row keeps the literal string, so the fact is not lost at
+#: the level that can hold it.
+_SUBAGENT_OUTCOMES: Final[frozenset[str]] = frozenset({"completed", "failed", "stopped", "unknown"})
+
+#: Entry types ``subagents`` reads: one opener and two closers. ``subagent/steered`` is
+#: DECLARED in the session vocabulary and deliberately not read here -- a steer is an event
+#: about a child rather than a state of one, and nothing this fold answers for is a count of
+#: them. Leaving it out of ``affects`` is safe in the direction that matters: the set may be
+#: wider than the truth but never narrower, and a type the step ignores would cost a copy
+#: per entry for a value that never changes.
+SUBAGENT_TYPES: Final[frozenset[str]] = frozenset(
+    {
+        "subagent/spawned",
+        "subagent/completed",
+        "subagent/failed",
+    }
+)
+
+
+def _subagents_start() -> dict[str, Any]:
+    return {
+        "by_id": {},
+        # Deliberately NO ``open`` list. ``_subagents_render`` answers which children are
+        # still going from the rows themselves (an ``outcome`` of ``None``) and from the
+        # totals, so a second list here would be state nothing reads, kept in step by hand
+        # on every closer.
+        # Dispatches this fold did NOT retain, because ``by_id`` was at its cap.
+        "omitted": 0,
+        "totals": {
+            # EVERY dispatch, including the ones ``omitted`` counts. See
+            # ``_subagents_render`` for why the two are allowed to disagree.
+            "spawned": 0,
+            "completed": 0,
+            "failed": 0,
+            "stopped": 0,
+            "unknown": 0,
+            # Closers that found no row. Without this, a session whose totals exceed
+            # what its rows account for reads as an arithmetic bug.
+            "closed_unmatched": 0,
+            "ms": 0,
+            # How many closers REPORTED a duration, so a zero total reads as "nobody said"
+            # rather than "it took no time" -- the posture ``credits_reported`` takes.
+            "ms_reported": 0,
+            "credits": 0.0,
+            # How many closers REPORTED a cost, so a zero total is legible as "nobody
+            # said" rather than as "it cost nothing". Same posture as ``usage``.
+            "credits_reported": 0,
+        },
+    }
+
+
+def _subagent_credits(value: Any, total: float) -> float | None:
+    """*value* as a credit charge, or ``None`` when no charge was reported.
+
+    Absent is NOT zero: a child that was never billed and a child that cost nothing
+    are different facts, and only one of them is a measurement.
+
+    The SHAPE screen is :func:`_credit_charge`, the module's single one -- this function
+    adds only the part that is about THIS fold's running total, and it is the same
+    invariant :func:`_bill_credits` states: a spend total stays finite and never goes
+    down. Checking the charge instead needs a clause per unusable shape (NaN, each
+    infinity, a negative, and two finite values that overflow on the way up are four
+    inputs with one consequence), and the consequence is what cannot be undone -- a
+    non-finite total survives ``round``, the savepoint persists it, and a cold refold
+    reads the same entry again, so the fold would serve a broken total for the life of
+    the unit.
+    """
+    charge = _credit_charge(value)
+    if charge is None:
+        return None
+    grown = total + charge
+    if not math.isfinite(grown) or grown < total:
+        return None
+    return charge
+
+
+def _subagents_step(state: dict[str, Any], entry: Entry) -> None:
+    data = entry.data
+    agent_id = _as_id(data.get("agent_id"))
+    rows: dict[str, Any] = state["by_id"]
+    totals: dict[str, Any] = state["totals"]
+
+    if entry.type == "subagent/spawned":
+        # Counted BEFORE the cap is consulted: this is how many children the session
+        # dispatched, which is a fact about the session rather than about how many rows
+        # this fold chose to keep.
+        totals["spawned"] += 1
+        # An empty or over-long id identifies nothing, so keying a row by it would make
+        # every such child the same child and let one closer close another's row. It is
+        # counted above and left unretained, the same path a dispatch past the cap takes.
+        if not agent_id or agent_id in rows:
+            if not agent_id:
+                state["omitted"] += 1
+            return
+        if len(rows) >= OPEN_RETAIN_LIMIT:
+            # The bound this module holds everywhere: a session that dispatched more
+            # children than the cap keeps its totals exact and stops growing the state.
+            state["omitted"] += 1
+            return
+        rows[agent_id] = {
+            "agent_id": agent_id,
+            # Retained because ``render`` orders the rows by it. Deliberately the SEQ and
+            # not the time: two children dispatched in one millisecond tie on a clock, and
+            # a seq is what the log guarantees is ordered.
+            "seq_spawned": entry.seq,
+            "agent": _as_str(data.get("agent")),
+            "model": _as_str(data.get("model")),
+            "outcome": None,
+            # ``None``, not 0, for the same reason ``credits`` is: a closer writes ``ms``
+            # only when it measured a duration above zero, and crash-repair's closer writes
+            # none at all, so a 0 would present an absent measurement as a measured instant.
+            "ms": None,
+            "credits": None,
+            "reason": "",
+        }
+        return
+
+    # A closer, and the type is matched EXPLICITLY rather than reached by falling through
+    # the two branches above. ``affects`` spares this fold the entries it does not read,
+    # but only on the kernel's path (:class:`_SessionFold`): :func:`advance` and
+    # :func:`fold` call ``step`` for every entry in the file, so a fall-through ``else``
+    # here would bill every ``turn/completed`` in the log as a child that closed.
+    if entry.type not in ("subagent/completed", "subagent/failed"):
+        return
+    if entry.type == "subagent/completed":
+        outcome = "completed"
+    else:
+        outcome = _as_str(data.get("outcome")) or "unknown"
+    counted = outcome if outcome in _SUBAGENT_OUTCOMES else "unknown"
+    raw_ms = data.get("ms")
+    ms = raw_ms if isinstance(raw_ms, int) and not isinstance(raw_ms, bool) else None
+    # Screened against the total it would JOIN, so the invariant is about the result.
+    credits = _subagent_credits(data.get("credits"), totals["credits"])
+
+    # The totals move for EVERY closer, row or no row. crash-repair closes a child
+    # across the whole file, so a closer routinely names a dispatch this fold omitted --
+    # and dropping it would under-report what the session actually ran and spent, which
+    # is the one number a reader comes here for.
+    totals[counted] += 1
+    if ms is not None:
+        totals["ms"] += ms
+        totals["ms_reported"] += 1
+    if credits is not None:
+        totals["credits"] += credits
+        totals["credits_reported"] += 1
+
+    row = rows.get(agent_id) if agent_id else None
+    if row is None:
+        totals["closed_unmatched"] += 1
+        return
+    row["outcome"] = outcome
+    row["ms"] = ms
+    row["credits"] = credits
+    row["reason"] = _as_str(data.get("reason"))
+
+
+def _subagents_render(state: dict[str, Any]) -> dict[str, Any]:
+    """The children this session dispatched, in dispatch order.
+
+    ``totals["spawned"]`` and ``by_id`` are allowed to DISAGREE, and ``omitted`` is
+    what reconciles them: ``spawned == len(by_id) + omitted``. A reader that wants to
+    know what the session did reads the total; one that wants per-child detail reads the
+    rows and is told, by a non-zero ``omitted``, that it is holding a window rather than
+    the whole list. Reporting only the retained count would silently shrink a long
+    session's history to the cap and look exact.
+
+    ``credits`` on a row is ``None`` when that child reported no charge, never ``0``.
+    A surface drawing this has three states to draw, not two: a number, "no charge was
+    reported", and a child that has not closed yet.
+
+    ``running`` is the EXACT number still open and ``open`` is only the retained subset of
+    it. They differ once the cap has dropped a dispatch, because a dropped child has no row
+    to be absent an outcome from -- so a reader counting ``open`` would report a session
+    with 600 children in flight as having 512, or fewer. ``running`` is derived from the
+    totals instead (dispatches minus closers), which retention never touches, and is
+    floored at 0 so a log holding more closers than openers reads as none running rather
+    than as a negative count.
+    """
+    rows = sorted(state["by_id"].values(), key=lambda row: row["seq_spawned"])
+    totals = dict(state["totals"])
+    totals["credits"] = round(totals["credits"], 6)
+    closed = sum(totals[outcome] for outcome in sorted(_SUBAGENT_OUTCOMES))
+    return {
+        "by_id": {
+            row["agent_id"]: {
+                "agent_id": row["agent_id"],
+                "seq_spawned": row["seq_spawned"],
+                "agent": row["agent"],
+                "model": row["model"],
+                "outcome": row["outcome"],
+                "ms": row["ms"],
+                "credits": row["credits"],
+                "reason": row["reason"],
+            }
+            for row in rows
+        },
+        # The retained children with no closer yet, oldest first -- the same order the rows
+        # are in. Derived from the rows rather than kept as its own list, so it cannot fall
+        # out of step with them. A SUBSET of ``running``; see the docstring.
+        "open": [row["agent_id"] for row in rows if row["outcome"] is None],
+        "running": max(0, totals["spawned"] - closed),
+        "omitted": state["omitted"],
+        "limit": OPEN_RETAIN_LIMIT,
+        "totals": totals,
     }
 
 
@@ -4483,6 +4730,20 @@ def _approvals_copy(state: dict[str, Any]) -> dict[str, Any]:
     return grown
 
 
+def _subagents_copy(state: dict[str, Any]) -> dict[str, Any]:
+    """A per-child row is filled in by its closer, and ``open`` gains and loses ids.
+
+    Two containers the step reaches: the row dict for the child a closer names, and the
+    ``totals`` dict every branch increments. Every value inside a
+    row is a scalar, so the row's shallow copy covers it. Bounded by
+    ``OPEN_RETAIN_LIMIT`` rows of fixed width.
+    """
+    grown = dict(state)
+    grown["by_id"] = {agent_id: dict(row) for agent_id, row in state["by_id"].items()}
+    grown["totals"] = dict(state["totals"])
+    return grown
+
+
 _FOLDS: Final[dict[str, _Fold]] = {
     # ``affects=None``: every entry moves these two. ``status`` counts entries and
     # keeps the newest time, and ``class`` records the seq it saw so a gap in the
@@ -4524,6 +4785,18 @@ _FOLDS: Final[dict[str, _Fold]] = {
         _approvals_render,
         affects=APPROVAL_TYPES,
         copy_state=_approvals_copy,
+    ),
+    # LAZY, and the reason is not this fold's own: eager folding continues the warm SLOT
+    # memo, and this fold is keyed by one SESSION. See the import-time rule below
+    # (``EAGER_FOLD_NAMES <= SLOT_PROJECTION_NAMES``). A reader asks for this one when it
+    # draws the panel, which is a read per turn rather than a read on a timer.
+    "subagents": _Fold(
+        "subagents",
+        _subagents_start,
+        _subagents_step,
+        _subagents_render,
+        affects=SUBAGENT_TYPES,
+        copy_state=_subagents_copy,
     ),
     "class": _Fold("class", _class_start, _class_step, _class_render, copy_state=_flat_copy),
     # The SLOT-keyed folds each answer to exactly ONE entry type -- their ``step``

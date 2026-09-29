@@ -10630,7 +10630,21 @@
         "moment_model_selected": "[ɱøðèĺ çĥøşèñ ···········]",
         "moment_write_dropped": "[èñţŕìèş ĺøşţ ···········]",
         "moment_approval_requested": "[àþþŕøṽàĺ àşķèð ·············]",
-        "moment_approval_decided": "[àþþŕøṽàĺ àñşẁèŕèð ···············]"
+        "moment_approval_decided": "[àþþŕøṽàĺ àñşẁèŕèð ···············]",
+        "section_subagents": "[Şùƀàğèñţş ··············]",
+        "summary_subagents": "[ðìşþàţçĥèð: {{spawned}} · ŕùññìñğ: {{open}} ·················]",
+        "subagents_empty": "[Ñø şùƀàğèñţş ðìşþàţçĥèð. ·················]",
+        "stat_spawned": "[şùƀàğèñţş ðìşþàţçĥèð ··················]",
+        "col_agent": "[şùƀàğèñţ ············]",
+        "col_outcome": "[øùţçøɱè ···········]",
+        "outcome_completed": "[ƒìñìşĥèð ············]",
+        "outcome_failed": "[ƒàìĺèð ·········]",
+        "outcome_stopped": "[şţøþþèð ···········]",
+        "outcome_unknown": "[ùñķñøẁñ ···········]",
+        "outcome_running": "[ŕùññìñğ ···········]",
+        "credits_not_reported": "[ñøţ ŕèþøŕţèð ···········]",
+        "subagents_undetailed": "[{{count}} ɱøŕè çøùñţèð àƀøṽè, ñøţ ĺìşţèð ĥèŕè ··················]",
+        "subagents_undetailed_running": "[{{count}} ɱøŕè çøùñţèð àƀøṽè, ñøţ ĺìşţèð ĥèŕè ({{running}} şţìĺĺ ŕùññìñğ) ···················]"
       },
       "decisionStrip": {
         "steer_confidence": "[çøñƒìðèñçè {{p}} ··········]",
